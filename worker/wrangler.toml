@@ -14,7 +14,7 @@ database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
 
 [vars]
 # Public hostname of your tunnel, e.g. https://photos-api.example.com
-LAN_API_URL = "https://photos-api.example.com"
+LAN_API_URL = "https://photos.tahajomha.com"
 
 # Secrets (set with `wrangler secret put`):
 #   LAN_API_TOKEN            required, must match API_TOKEN on the LAN API
