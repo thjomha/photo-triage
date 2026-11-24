@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Photo Triage</title>
+<style>
+  :root { --bg:#14161a; --panel:#1d2026; --line:#2c313a; --text:#e8eaee; --dim:#8b93a1;
+          --keep:#2fa66a; --del:#d64550; --accent:#5b8def; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+               font:16px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; }
+  button { font:inherit; color:inherit; cursor:pointer; border:1px solid var(--line);
+           background:var(--panel); border-radius:10px; padding:10px 16px; }
+  button:hover { border-color:var(--dim); }
+  button:disabled { opacity:.4; cursor:default; }
+  .primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  #app { max-width:760px; margin:0 auto; padding:16px; min-height:100%; }
+  .crumbs { display:flex; flex-wrap:wrap; gap:4px; align-items:center; color:var(--dim); margin-bottom:14px; }
+  .crumbs a { color:var(--accent); cursor:pointer; text-decoration:none; }
+  .bar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+  .list { display:flex; flex-direction:column; gap:6px; }
+  .row { display:flex; align-items:center; gap:10px; padding:12px 14px; background:var(--panel);
+         border:1px solid var(--line); border-radius:10px; cursor:pointer; }
+  .row:hover { border-color:var(--dim); }
+  .row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .badge { font-size:12px; padding:2px 8px; border-radius:99px; border:1px solid var(--line); color:var(--dim); white-space:nowrap; }
+  .badge.done { color:var(--keep); border-color:var(--keep); }
+  .badge.partial { color:#e0a63a; border-color:#e0a63a; }
+  .badge.new { color:var(--accent); border-color:var(--accent); }
+  .muted { color:var(--dim); }
+  .err { background:#3a1c20; border:1px solid var(--del); padding:10px 14px; border-radius:10px; margin-bottom:12px; }
+  /* review */
+  #review { position:fixed; inset:0; display:flex; flex-direction:column; background:#000; touch-action:pan-y; }
+  #review header { display:flex; justify-content:space-between; align-items:center; gap:10px;
+                   padding:calc(10px + env(safe-area-inset-top)) 14px 10px; color:var(--dim); font-size:14px; }
+  #review header .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #stage { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; position:relative; }
+  #stage img { max-width:100%; max-height:100%; object-fit:contain; transition:transform .15s, opacity .15s; }
+  #stage .fname { position:absolute; bottom:8px; left:0; right:0; text-align:center; font-size:12px; color:var(--dim);
+                  text-shadow:0 1px 3px #000; pointer-events:none; }
+  #stage .flash { position:absolute; inset:0; pointer-events:none; opacity:0; transition:opacity .2s; }
+  #actions { display:flex; gap:10px; padding:12px 14px calc(12px + env(safe-area-inset-bottom)); }
+  #actions button { flex:1; padding:16px 10px; font-size:18px; font-weight:600; border:0; }
+  #actions .del { background:var(--del); } #actions .keep { background:var(--keep); }
+  #actions .undo { flex:0 0 64px; background:var(--panel); font-weight:400; }
+  .center { text-align:center; padding:60px 20px; }
+  #toast { position:fixed; left:50%; bottom:90px; transform:translateX(-50%); background:#3a1c20; border:1px solid var(--del);
+           padding:10px 16px; border-radius:10px; z-index:10; display:none; max-width:90%; }
+  .hint { font-size:12px; color:var(--dim); text-align:center; padding-bottom:6px; }
+  @media (hover:none) { .hint.kbd { display:none; } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+
+<script>
+const $app = document.getElementById('app');
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function api(p, opts) {
+  const r = await fetch('/api/' + p, opts);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'Request failed (' + r.status + ')');
+  return j;
+}
+const post = (p, body) => api(p, { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body) });
+const q = (path) => 'path=' + encodeURIComponent(path);
+const imgUrl = (p) => '/api/img?w=1800&' + q(p);
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast.h); toast.h = setTimeout(() => (t.style.display = 'none'), 4000);
+}
+
+/* ---------- routing: #browse:<path> or #review:<path> ---------- */
+function go(mode, path) { location.hash = mode + ':' + encodeURIComponent(path); }
+window.addEventListener('hashchange', route);
+function route() {
+  const m = /^#(browse|review):(.*)$/.exec(location.hash);
+  const mode = m ? m[1] : 'browse';
+  const path = m ? decodeURIComponent(m[2]) : '';
+  (mode === 'review' ? reviewView : browseView)(path);
+}
+
+/* ---------- browse ---------- */
+const badge = (f) => {
+  if (f.status === 'done') return '<span class="badge done">✓ done</span>';
+  if (f.status === 'partial') return `<span class="badge partial">${f.kept + f.deleted}/${f.photoCount + f.deleted} reviewed</span>`;
+  if (f.status === 'new') return `<span class="badge new">${f.photoCount} new</span>`;
+  if (f.reviewedInside) return `<span class="badge partial">${f.reviewedInside} reviewed inside</span>`;
+  return '';
+};
+
+async function browseView(path) {
+  cleanupReview();
+  $app.innerHTML = '<p class="muted">Loading…</p>';
+  try {
+    const [d, resume] = await Promise.all([api('folders?' + q(path)), api('resume')]);
+    const parts = path ? path.split('/') : [];
+    let acc = '';
+    const crumbs = ['<a data-p="">Root</a>'].concat(parts.map((p) => {
+      acc += (acc ? '/' : '') + p; return `<span>/</span><a data-p="${esc(acc)}">${esc(p)}</a>`;
+    }));
+    const pending = d.photoCount - d.kept;
+    let html = `<div class="crumbs">${crumbs.join('')}</div><div class="bar">`;
+    if (resume.folder !== null && resume.folder !== path)
+      html += `<button class="primary" id="resume">↩ Resume: ${esc(resume.folder || 'Root')}</button>`;
+    if (d.photoCount > 0)
+      html += pending > 0
+        ? `<button class="primary" id="start">Review ${pending} photo${pending === 1 ? '' : 's'} here</button>`
+        : `<span class="badge done">✓ all photos in this folder reviewed</span>`;
+    html += '</div>';
+    html += d.folders.length
+      ? '<div class="list">' + d.folders.map((f) =>
+          `<div class="row" data-p="${esc(f.path)}"><span class="name">📁 ${esc(f.name)}</span>${badge(f)}</div>`).join('') + '</div>'
+      : '<p class="muted">No subfolders.</p>';
+    $app.innerHTML = html;
+    $app.querySelectorAll('[data-p]').forEach((el) => el.addEventListener('click', () => go('browse', el.dataset.p)));
+    $app.querySelector('#start')?.addEventListener('click', () => go('review', path));
+    $app.querySelector('#resume')?.addEventListener('click', () => go('review', resume.folder));
+  } catch (e) {
+    $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="route()">Retry</button>`;
+  }
+}
+
+/* ---------- review ---------- */
+let R = null; // review state
+
+function cleanupReview() {
+  if (R) { window.removeEventListener('keydown', R.onKey); R = null; }
+}
+
+async function reviewView(path) {
+  cleanupReview();
+  $app.innerHTML = '<p class="muted">Loading…</p>';
+  let d;
+  try { d = await api('photos?' + q(path)); }
+  catch (e) { $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="history.back()">Back</button>`; return; }
+
+  R = { path, queue: d.pending.slice(), history: [], kept: d.kept, deleted: d.deleted, chain: Promise.resolve(), busy: false };
+  R.onKey = (e) => {
+    if (e.target.tagName === 'INPUT') return;
+    if (e.key === 'ArrowRight' || e.key === 'k') decide('keep');
+    else if (e.key === 'ArrowLeft' || e.key === 'd' || e.key === 'Delete') decide('delete');
+    else if (e.key === 'z' || e.key === 'Backspace') undo();
+    else if (e.key === 'Escape') leave();
+  };
+  window.addEventListener('keydown', R.onKey);
+  renderReview();
+}
+
+function leave() { go('browse', R ? R.path : ''); }
+
+function renderReview() {
+  const left = R.queue.length;
+  const title = R.path || 'Root';
+  $app.innerHTML = `
+    <div id="review">
+      <header><button id="back">← Folders</button><span class="t">${esc(title)}</span><span>${left} left</span></header>
+      <div id="stage"></div>
+      <div class="hint kbd">→ / K keep · ← / D delete · Z undo · Esc back &nbsp;|&nbsp; swipe right = keep, left = delete</div>
+      <div id="actions">
+        <button class="undo" id="undo" title="Undo (Z)">↶</button>
+        <button class="del" id="del">🗑 Delete</button>
+        <button class="keep" id="keep">✓ Keep</button>
+      </div>
+    </div>`;
+  document.getElementById('back').onclick = leave;
+  document.getElementById('del').onclick = () => decide('delete');
+  document.getElementById('keep').onclick = () => decide('keep');
+  document.getElementById('undo').onclick = undo;
+  attachSwipe(document.getElementById('stage'));
+  showCurrent();
+}
+
+function showCurrent() {
+  const stage = document.getElementById('stage');
+  if (!stage) return;
+  const hdr = document.querySelector('#review header span:last-child');
+  if (hdr) hdr.textContent = R.queue.length + ' left';
+  document.getElementById('undo').disabled = R.history.length === 0;
+
+  if (R.queue.length === 0) {
+    stage.innerHTML = `<div class="center"><h2>Folder done ✓</h2>
+      <p class="muted">${R.kept} kept · ${R.deleted} deleted</p>
+      <button class="primary" id="finish">Back to folders</button></div>`;
+    document.getElementById('finish').onclick = leave;
+    document.getElementById('keep').disabled = document.getElementById('del').disabled = true;
+    return;
+  }
+  document.getElementById('keep').disabled = document.getElementById('del').disabled = false;
+  const cur = R.queue[0];
+  stage.innerHTML = `<img alt="" src="${imgUrl(cur)}"><div class="fname">${esc(cur.split('/').pop())}</div>`;
+  const img = stage.querySelector('img');
+  img.onerror = () => toast('Could not load this image. Press the key again to skip it, or reload.');
+  R.queue.slice(1, 4).forEach((p) => { new Image().src = imgUrl(p); }); // preload next few
+}
+
+// Optimistic: advance immediately, sync with the server in order in the background.
+function decide(decision) {
+  if (!R || R.queue.length === 0) return;
+  const p = R.queue.shift();
+  R.history.push({ path: p, decision });
+  decision === 'keep' ? R.kept++ : R.deleted++;
+  const state = R;
+  state.chain = state.chain.then(() => post('decide', { path: p, decision })).catch((e) => {
+    toast('Failed to save ' + p.split('/').pop() + ': ' + e.message);
+    // put it back so nothing is silently lost
+    const i = state.history.findIndex((h) => h.path === p);
+    if (i >= 0) state.history.splice(i, 1);
+    decision === 'keep' ? state.kept-- : state.deleted--;
+    state.queue.unshift(p);
+    if (R === state) showCurrent();
+  });
+  flash(decision);
+  showCurrent();
+}
+
+function undo() {
+  if (!R || R.history.length === 0) return;
+  const state = R;
+  const last = state.history.pop();
+  last.decision === 'keep' ? state.kept-- : state.deleted--;
+  state.queue.unshift(last.path);
+  state.chain = state.chain.then(() => post('undo', { path: last.path })).catch((e) => toast('Undo failed: ' + e.message));
+  showCurrent();
+}
+
+function flash(decision) {
+  const stage = document.getElementById('stage');
+  if (!stage) return;
+  const f = document.createElement('div');
+  f.className = 'flash';
+  f.style.background = decision === 'keep' ? 'rgba(47,166,106,.35)' : 'rgba(214,69,80,.35)';
+  stage.appendChild(f);
+  requestAnimationFrame(() => { f.style.opacity = 1; setTimeout(() => f.remove(), 180); });
+}
+
+function attachSwipe(el) {
+  let x0 = null, y0 = null;
+  el.addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+  el.addEventListener('touchend', (e) => {
+    if (x0 === null) return;
+    const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+    x0 = null;
+    if (Math.abs(dx) > 80 && Math.abs(dx) > Math.abs(dy) * 1.5) decide(dx > 0 ? 'keep' : 'delete');
+  });
+}
+
+route();
+</script>
+</body>
+</html>

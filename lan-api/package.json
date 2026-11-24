@@ -1,0 +1,9 @@
+{
+  "name": "photo-triage-lan-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.js" },
+  "optionalDependencies": { "sharp": "^0.33.0" },
+  "engines": { "node": ">=18" }
+}

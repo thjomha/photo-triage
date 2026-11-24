@@ -1,0 +1,6 @@
+# Example /etc/fstab line for a UniFi NAS SMB share. Replace UNAS_IP and ShareName.
+# uid/gid must be the user that runs the LAN API (check with `id photo-triage`).
+//UNAS_IP/ShareName  /mnt/photos  cifs  credentials=/etc/photo-triage-smb.creds,uid=1000,gid=1000,iocharset=utf8,vers=3.0,_netdev,nofail  0  0
+
+# NFS alternative (if you enabled NFS on the NAS; needs `apt install nfs-common`):
+# UNAS_IP:/path/to/share  /mnt/photos  nfs  defaults,_netdev,nofail  0  0
