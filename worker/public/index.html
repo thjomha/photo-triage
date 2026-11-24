@@ -52,6 +52,13 @@
   .note { background:#1f2a3d; border:1px solid #33496d; color:#b9c8e3; padding:8px 12px; border-radius:10px;
           font-size:13px; margin-bottom:12px; }
   .small { font-size:12px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin-bottom:14px; }
+  .card h3 { margin:0 0 10px; font-size:16px; }
+  .opt { display:flex; gap:10px; align-items:flex-start; padding:8px 0; cursor:pointer; }
+  .opt input { margin-top:4px; }
+  input[type=text], input:not([type]) { font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--line);
+          border-radius:8px; padding:9px 12px; min-width:0; flex:1 1 160px; }
+  code { background:var(--bg); padding:1px 5px; border-radius:4px; }
   .mrow { display:flex; align-items:center; gap:12px; padding:8px; background:var(--panel);
           border:1px solid var(--line); border-radius:10px; margin-bottom:6px; }
   .mrow img { width:64px; height:64px; object-fit:cover; border-radius:6px; background:#000; display:block; }
@@ -92,10 +99,10 @@ const markMode = () => CONFIG.deleteMode !== 'move';
 function go(mode, path) { location.hash = mode + ':' + encodeURIComponent(path); }
 window.addEventListener('hashchange', route);
 function route() {
-  const m = /^#(browse|review|marked):(.*)$/.exec(location.hash);
+  const m = /^#(browse|review|marked|settings):(.*)$/.exec(location.hash);
   const mode = m ? m[1] : 'browse';
   const path = m ? decodeURIComponent(m[2]) : '';
-  configP.then(() => ({ review: reviewView, marked: markedView }[mode] || browseView)(path));
+  configP.then(() => ({ review: reviewView, marked: markedView, settings: settingsView }[mode] || browseView)(path));
 }
 
 /* ---------- browse ---------- */
@@ -129,6 +136,7 @@ async function browseView(path) {
         : `<span class="badge done">✓ all photos in this folder reviewed</span>`;
     html += `<button id="dellist">🗑 Delete list (${d.deleteListTotal})</button>`;
     if (path) html += '<button id="dellist-here">This folder’s list</button>';
+    html += '<button id="settings" title="Settings">⚙ Settings</button>';
     html += '</div>';
     html += d.folders.length
       ? '<div class="list">' + d.folders.map((f) =>
@@ -140,6 +148,7 @@ async function browseView(path) {
     $app.querySelector('#resume')?.addEventListener('click', () => go('review', resume.folder));
     $app.querySelector('#dellist')?.addEventListener('click', () => go('marked', ''));
     $app.querySelector('#dellist-here')?.addEventListener('click', () => go('marked', path));
+    $app.querySelector('#settings')?.addEventListener('click', () => go('settings', ''));
   } catch (e) {
     $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="route()">Retry</button>`;
   }
@@ -268,6 +277,136 @@ function attachSwipe(el) {
     x0 = null;
     if (Math.abs(dx) > 80 && Math.abs(dx) > Math.abs(dy) * 1.5) decide(dx > 0 ? 'keep' : 'delete');
   });
+}
+
+/* ---------- settings ---------- */
+const del = (p, body) => api(p, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+
+async function settingsView() {
+  cleanupReview();
+  $app.innerHTML = '<p class="muted">Loading…</p>';
+  let s;
+  try { s = await api('settings'); }
+  catch (e) { $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="route()">Retry</button>`; return; }
+  CONFIG.deleteMode = s.deleteMode;
+
+  $app.innerHTML = `
+    <div class="crumbs"><a id="back">← Folders</a></div>
+    <h2 style="margin:0 0 12px">Settings</h2>
+
+    <section class="card">
+      <h3>When you press Delete</h3>
+      <label class="opt"><input type="radio" name="mode" value="mark" ${s.deleteMode === 'mark' ? 'checked' : ''}>
+        <span><b>Mark only</b> (recommended)<br><span class="muted small">Adds the photo to the delete list. Nothing on the drive changes, so a read-only share works.</span></span></label>
+      <label class="opt"><input type="radio" name="mode" value="move" ${s.deleteMode === 'move' ? 'checked' : ''}>
+        <span><b>Move to _trash</b><br><span class="muted small">Also moves the file into a <code>_trash</code> folder on the share. Never permanently deletes. Needs write access to the share.</span></span></label>
+      <div class="bar"><button class="primary" id="savemode">Save</button><span id="modemsg" class="muted small"></span></div>
+    </section>
+
+    <section class="card">
+      <h3>Apply marked deletions</h3>
+      <p class="muted" id="pendingtxt"></p>
+      <div class="bar"><button id="apply"></button></div>
+      <div id="applystatus" class="small"></div>
+    </section>
+
+    <section class="card">
+      <h3>Network shares</h3>
+      <div id="shares"><p class="muted">Loading…</p></div>
+    </section>`;
+  document.getElementById('back').onclick = () => go('browse', '');
+
+  // -- delete behaviour --
+  document.getElementById('savemode').onclick = async () => {
+    const mode = document.querySelector('input[name=mode]:checked').value;
+    if (mode === s.deleteMode) { document.getElementById('modemsg').textContent = 'No change.'; return; }
+    if (mode === 'move' && !confirm('From now on, Delete will move photos into a _trash folder on the share (never permanent). The share needs write access. Continue?')) return;
+    try {
+      await post('settings', { deleteMode: mode });
+      s.deleteMode = mode; CONFIG.deleteMode = mode;
+      document.getElementById('modemsg').textContent = 'Saved.';
+    } catch (e) { toast('Could not save: ' + e.message); }
+  };
+
+  // -- apply marked --
+  const paintPending = () => {
+    document.getElementById('pendingtxt').textContent = s.pendingMove
+      ? `${s.pendingMove} photo${s.pendingMove === 1 ? ' is' : 's are'} marked for deletion and still on the drive.`
+      : 'No marked photos are waiting on the drive.';
+    const b = document.getElementById('apply');
+    b.textContent = `Move ${s.pendingMove} marked photo${s.pendingMove === 1 ? '' : 's'} to _trash`;
+    b.disabled = !s.pendingMove;
+  };
+  paintPending();
+  document.getElementById('apply').onclick = async () => {
+    if (!confirm(`Move ${s.pendingMove} marked photos into _trash on the share? They are not permanently deleted, and you can restore them from the delete list. The share needs write access.`)) return;
+    const b = document.getElementById('apply'), st = document.getElementById('applystatus');
+    b.disabled = true;
+    let after = '', moved = 0; const failed = [];
+    try {
+      for (;;) {
+        const r = await post('apply', { after });
+        moved += r.moved; failed.push(...r.failed); after = r.last;
+        st.textContent = `Moved ${moved}…`;
+        if (r.done) break;
+      }
+    } catch (e) { toast('Stopped: ' + e.message); }
+    st.innerHTML = `Moved ${moved} photo${moved === 1 ? '' : 's'} to _trash.` +
+      (failed.length ? ` <span style="color:#e07a84">${failed.length} failed</span> (first error: ${esc(failed[0].error)}).` : '');
+    try { s = { ...s, ...(await api('settings')) }; } catch {}
+    paintPending();
+  };
+
+  // -- network shares --
+  loadShares();
+}
+
+async function loadShares() {
+  const box = document.getElementById('shares');
+  let d;
+  try { d = await api('shares'); }
+  catch (e) { box.innerHTML = `<div class="note">${esc(e.message)}</div>`; return; }
+
+  box.innerHTML = `
+    <div class="list">${d.shares.map((sh) => `
+      <div class="row" style="cursor:default" data-n="${esc(sh.name)}">
+        <span class="name"><b>${esc(sh.name)}</b><br><span class="muted small">${esc(sh.path)}${sh.exists ? '' : ' · folder missing'}</span></span>
+        <button class="rm">Remove</button></div>`).join('')}</div>
+    <p class="muted small">Removing a share only stops the app from showing it. Your files aren't touched, and review progress is kept in case you add it back.</p>
+    <h4 style="margin:14px 0 6px">Add a share</h4>
+    <p class="muted small">The drive must already be mounted on the server (inside <code>${esc(d.base)}</code>). Pick a folder below.</p>
+    <div class="bar"><input id="sname" placeholder="Name shown in the app"><input id="spath" placeholder="${esc(d.base)}/…" value="${esc(d.base)}">
+      <button id="sbrowse">Browse</button><button class="primary" id="sadd">Add</button></div>
+    <div id="sbrowser"></div>`;
+
+  box.querySelectorAll('.rm').forEach((b) => b.addEventListener('click', async () => {
+    const name = b.closest('.row').dataset.n;
+    if (!confirm(`Remove the share “${name}” from the app? Your files are not touched.`)) return;
+    try { await del('shares', { name }); loadShares(); } catch (e) { toast(e.message); }
+  }));
+
+  const browse = async (dir) => {
+    const out = document.getElementById('sbrowser');
+    try {
+      const r = await api('shares/browse?dir=' + encodeURIComponent(dir));
+      document.getElementById('spath').value = r.path;
+      out.innerHTML = '<div class="list">' + (r.parent ? '<div class="row" data-d="' + esc(r.parent) + '">⬆ ..</div>' : '') +
+        (r.dirs.map((n) => `<div class="row" data-d="${esc(r.path + '/' + n)}">📁 ${esc(n)}</div>`).join('') || '<p class="muted small">No subfolders.</p>') + '</div>';
+      out.querySelectorAll('[data-d]').forEach((el) => el.addEventListener('click', () => {
+        const nm = document.getElementById('sname');
+        if (!nm.value || nm.dataset.auto) { nm.value = el.dataset.d.split('/').pop(); nm.dataset.auto = '1'; }
+        browse(el.dataset.d);
+      }));
+    } catch (e) { out.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+  document.getElementById('sname').addEventListener('input', (e) => delete e.target.dataset.auto);
+  document.getElementById('sbrowse').onclick = () => browse(document.getElementById('spath').value);
+  document.getElementById('sadd').onclick = async () => {
+    const name = document.getElementById('sname').value.trim(), p = document.getElementById('spath').value.trim();
+    if (!name) return toast('Enter a name for the share.');
+    try { await post('shares', { name, path: p }); loadShares(); } catch (e) { toast(e.message); }
+  };
+  browse(d.base);
 }
 
 /* ---------- delete list ---------- */

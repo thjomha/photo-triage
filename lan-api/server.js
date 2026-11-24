@@ -27,15 +27,27 @@ const HOST = process.env.HOST || '127.0.0.1';
 const SHARES = new Map();
 let MULTI = false;
 
+const CONFIG_FILE = process.env.CONFIG_FILE;
+// Folders offered by the in-app share picker must live under this directory (where you mount drives).
+const SHARES_BASE = path.resolve(process.env.SHARES_BASE || '/mnt');
+const validShareName = (name) => typeof name === 'string' && name.trim() === name && name.length > 0 &&
+  name.length <= 80 && !/[\\/]/.test(name) && !name.startsWith('.');
+
 function loadShares() {
-  if (process.env.CONFIG_FILE) {
-    const cfg = JSON.parse(fsSync.readFileSync(process.env.CONFIG_FILE, 'utf8'));
+  if (CONFIG_FILE) {
+    let cfg = { shares: {} };
+    try {
+      cfg = JSON.parse(fsSync.readFileSync(CONFIG_FILE, 'utf8'));
+    } catch (e) {
+      // A missing file gets a clear message below; anything else (bad JSON, permissions) is a real error.
+      if (e.code !== 'ENOENT') throw e;
+    }
     for (const [name, p] of Object.entries(cfg.shares || {})) {
-      if (!name || /[\\/]/.test(name) || name.startsWith('.')) throw new Error(`Invalid share name: "${name}"`);
+      if (!validShareName(name)) throw new Error(`Invalid share name: "${name}"`);
       if (typeof p !== 'string' || !p) throw new Error(`Share "${name}" needs a path`);
       SHARES.set(name, path.resolve(p));
     }
-    if (!SHARES.size) throw new Error('CONFIG_FILE has no shares');
+    if (!SHARES.size) throw new Error(`${CONFIG_FILE} has no shares (or does not exist yet). Add at least one: {"shares":{"Name":"/mnt/path"}}`);
     MULTI = true;
   } else if (process.env.PHOTO_ROOT) {
     SHARES.set('', path.resolve(process.env.PHOTO_ROOT));
@@ -158,12 +170,76 @@ async function countPhotos(dir) {
 
 const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true });
 
+// ---- share management (used by the Settings page) --------------------------------------------
+// This only edits the list of shares the app looks at. It never mounts, unmounts, moves or
+// deletes anything, and every folder must live under SHARES_BASE.
+
+async function folderInsideBase(p) {
+  const base = await fs.realpath(SHARES_BASE).catch(() => SHARES_BASE);
+  let real;
+  try { real = await fs.realpath(path.resolve(String(p))); }
+  catch { throw httpErr(400, 'That folder does not exist'); }
+  if (real !== base && !real.startsWith(base + path.sep)) throw httpErr(400, `Folder must be inside ${SHARES_BASE}`);
+  if (!(await fs.stat(real)).isDirectory()) throw httpErr(400, 'Not a folder');
+  return { real, base };
+}
+
+async function saveShares() {
+  const data = JSON.stringify({ shares: Object.fromEntries(SHARES) }, null, 2) + '\n';
+  try {
+    await fs.writeFile(CONFIG_FILE, data);
+  } catch (e) {
+    throw httpErr(500, `Could not save ${CONFIG_FILE}: ${e.code || e.message}. The service user needs write access to it.`);
+  }
+}
+
+async function admin(req, res, u) {
+  if (!MULTI || !CONFIG_FILE) {
+    throw httpErr(400, 'Managing shares in the app needs the LAN API to run with CONFIG_FILE (see README, "Several shares").');
+  }
+  if (req.method === 'GET' && u.pathname === '/admin/shares') {
+    const shares = [...SHARES].map(([name, p]) => ({ name, path: p, exists: fsSync.existsSync(p) }));
+    return send(res, 200, { base: SHARES_BASE, shares });
+  }
+  if (req.method === 'GET' && u.pathname === '/admin/browse') {
+    const { real, base } = await folderInsideBase(u.searchParams.get('path') || SHARES_BASE);
+    const entries = await fs.readdir(real, { withFileTypes: true });
+    const dirs = entries.filter((e) => e.isDirectory() && !isHidden(e.name)).map((e) => e.name).sort(byName);
+    return send(res, 200, { path: real, parent: real === base ? null : path.dirname(real), dirs });
+  }
+  if (req.method === 'POST' && u.pathname === '/admin/shares') {
+    const body = await readJson(req);
+    const name = String(body.name ?? '').trim();
+    if (!validShareName(name)) throw httpErr(400, 'Share name can\'t be empty, contain / or \\, or start with a dot');
+    if (SHARES.has(name)) throw httpErr(409, 'A share with that name already exists');
+    if (SHARES.size >= 50) throw httpErr(400, 'Too many shares');
+    const { real } = await folderInsideBase(body.path);
+    if ([...SHARES.values()].includes(real)) throw httpErr(409, 'That folder is already a share');
+    SHARES.set(name, real);
+    try { await saveShares(); } catch (e) { SHARES.delete(name); throw e; }
+    return send(res, 200, { ok: true });
+  }
+  if (req.method === 'DELETE' && u.pathname === '/admin/shares') {
+    const body = await readJson(req);
+    const name = String(body.name ?? '');
+    if (!SHARES.has(name)) throw httpErr(404, 'unknown share');
+    if (SHARES.size === 1) throw httpErr(400, 'Can\'t remove the last share');
+    const old = SHARES.get(name);
+    SHARES.delete(name);
+    try { await saveShares(); } catch (e) { SHARES.set(name, old); throw e; }
+    return send(res, 200, { ok: true });
+  }
+  throw httpErr(404, 'not found');
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (!authed(req)) return send(res, 401, { error: 'unauthorized' });
     const u = new URL(req.url, 'http://x');
     const rel = clean(u.searchParams.get('path'));
     const atVirtualRoot = MULTI && !rel;
+
+    if (u.pathname.startsWith('/admin/')) return await admin(req, res, u);
 
     // GET /folders?path=  -> immediate subfolders with the number of photos directly inside each.
     // In multi-share mode the top level lists the shares.

@@ -1,16 +1,24 @@
 // Cloudflare Worker: serves the UI, stores review progress in D1, and talks to the LAN file API
 // through a Cloudflare Tunnel.
 //
-// DELETE_MODE (wrangler.toml [vars]):
+// Delete behaviour:
 //   "mark" (default)  "Delete" only records the photo in D1. Nothing on the drive changes.
 //   "move"            "Delete" also moves the file into _trash on the share (needs write access).
+// The mode is a setting in the app (stored in D1). DELETE_MODE in wrangler.toml is only the
+// starting value, used until someone changes the setting in the app.
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
 const dirname = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 const esc = (s) => s.replace(/[\\%_]/g, '\\$&'); // escape LIKE wildcards
-const deleteMode = (env) => (env.DELETE_MODE === 'move' ? 'move' : 'mark');
+const MODES = ['mark', 'move'];
+
+async function getDeleteMode(env) {
+  const row = await env.DB.prepare("SELECT value FROM meta WHERE key = 'delete_mode'").first();
+  if (row && MODES.includes(row.value)) return { mode: row.value, source: 'app' };
+  return { mode: env.DELETE_MODE === 'move' ? 'move' : 'mark', source: 'default' };
+}
 
 function lan(env, path, init = {}) {
   const headers = new Headers(init.headers);
@@ -63,7 +71,66 @@ export default {
       const route = `${request.method} ${url.pathname}`;
       const path = (url.searchParams.get('path') ?? '').replace(/^\/+|\/+$/g, '');
 
-      if (route === 'GET /api/config') return json({ deleteMode: deleteMode(env) });
+      if (route === 'GET /api/config') return json({ deleteMode: (await getDeleteMode(env)).mode });
+
+      // ---- settings page ----
+      if (route === 'GET /api/settings') {
+        const { mode, source } = await getDeleteMode(env);
+        const pending = await env.DB.prepare(
+          "SELECT COUNT(*) AS c FROM decisions WHERE decision = 'delete' AND trashed IS NULL",
+        ).first();
+        return json({ deleteMode: mode, source, pendingMove: pending.c });
+      }
+
+      if (route === 'POST /api/settings') {
+        const { deleteMode } = await request.json();
+        if (!MODES.includes(deleteMode)) return json({ error: 'bad request' }, 400);
+        await setMeta(env, 'delete_mode', deleteMode);
+        return json({ ok: true, deleteMode });
+      }
+
+      // Move photos that are already marked into _trash, a small batch per request. The caller loops,
+      // passing back `last` as `after`, so a file that fails is skipped rather than retried forever.
+      if (route === 'POST /api/apply') {
+        const body = await request.json().catch(() => ({}));
+        const after = typeof body.after === 'string' ? body.after : '';
+        const { results } = await env.DB.prepare(
+          `SELECT path FROM decisions
+            WHERE decision = 'delete' AND trashed IS NULL AND path > ?1
+            ORDER BY path LIMIT 15`,
+        ).bind(after).all();
+        let moved = 0;
+        const failed = [];
+        for (const r of results) {
+          try {
+            const { trashed } = await lanJson(env, '/delete', post({ path: r.path }));
+            await env.DB.prepare('UPDATE decisions SET trashed = ?1 WHERE path = ?2').bind(trashed, r.path).run();
+            moved++;
+          } catch (e) {
+            failed.push({ path: r.path, error: e.message });
+          }
+        }
+        const last = results.length ? results[results.length - 1].path : after;
+        const rem = await env.DB.prepare(
+          "SELECT COUNT(*) AS c FROM decisions WHERE decision = 'delete' AND trashed IS NULL AND path > ?1",
+        ).bind(last).first();
+        return json({ moved, failed, last, remaining: rem.c, done: results.length === 0 || rem.c === 0 });
+      }
+
+      // ---- network shares (managed on the LAN API, which edits its own config file) ----
+      if (route === 'GET /api/shares') return json(await lanJson(env, '/admin/shares'));
+      if (route === 'GET /api/shares/browse') {
+        const dir = url.searchParams.get('dir') || '';
+        return json(await lanJson(env, `/admin/browse?path=${encodeURIComponent(dir)}`));
+      }
+      if (route === 'POST /api/shares') {
+        const { name, path: p } = await request.json();
+        return json(await lanJson(env, '/admin/shares', post({ name, path: p })));
+      }
+      if (route === 'DELETE /api/shares') {
+        const { name } = await request.json();
+        return json(await lanJson(env, '/admin/shares', { ...post({ name }), method: 'DELETE' }));
+      }
 
       // Folder browser: LAN folder list merged with review progress from D1.
       if (route === 'GET /api/folders') {
@@ -158,7 +225,7 @@ export default {
         const { path: p, decision } = await request.json();
         if (!p || !['keep', 'delete'].includes(decision)) return json({ error: 'bad request' }, 400);
         let trashed = null;
-        if (decision === 'delete' && deleteMode(env) === 'move') {
+        if (decision === 'delete' && (await getDeleteMode(env)).mode === 'move') {
           // Move on the LAN first; only record the decision if that worked.
           trashed = (await lanJson(env, '/delete', post({ path: p }))).trashed;
         }

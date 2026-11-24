@@ -54,12 +54,30 @@ curl -s -H "Authorization: Bearer $(grep API_TOKEN /etc/photo-triage.env | cut -
 
 You should see JSON listing your top-level folders. If the Debian "instance" is a container with no systemd, run `node server.js` under pm2 or Docker instead.
 
-## Adding more shares later
+## Several shares, managed from the app
 
-1. Mount the new share, with another line in `/etc/fstab` and its own mount point, for example `/mnt/other-nas`. Run `sudo mount -a` and check it with `ls`.
-2. Create `/etc/photo-triage.json` listing every share you want in the app (see the main README, "Several shares").
-3. In `/etc/photo-triage.env`, delete the `PHOTO_ROOT=` line and add `CONFIG_FILE=/etc/photo-triage.json`.
-4. `sudo systemctl restart photo-triage-lan`, then reload the app. Each share now shows as a top-level folder.
+One-time switch from a single `PHOTO_ROOT` to a config file. Replace `thjomha` with the user the service runs as:
+
+```bash
+sudo tee /etc/photo-triage.json >/dev/null <<'EOF'
+{ "shares": { "Camera Archives": "/mnt/photos/Camera Achives" } }
+EOF
+sudo chown thjomha /etc/photo-triage.json      # the app edits this file when you add/remove shares
+
+sudo sed -i '/^PHOTO_ROOT=/d' /etc/photo-triage.env
+echo 'CONFIG_FILE=/etc/photo-triage.json' | sudo tee -a /etc/photo-triage.env
+echo 'SHARES_BASE=/mnt'                    | sudo tee -a /etc/photo-triage.env
+sudo systemctl restart photo-triage-lan
+```
+
+If you had already reviewed photos, run `worker/migrations/single-to-multi-share.sql` once in the D1 console (see the main README), because paths now start with the share name.
+
+To add another drive later:
+
+1. Mount it yourself, with another line in `/etc/fstab` and its own mount point under `/mnt`, for example `/mnt/other-nas`. Run `sudo mount -a` and check it with `ls`.
+2. In the app, open **⚙ Settings → Network shares**, pick the folder, give it a name and press **Add**. No restart is needed.
+
+Removing a share in the app only removes it from the list. It doesn't touch any files or unmount anything.
 
 ## 3. Cloudflare Tunnel
 

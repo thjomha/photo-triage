@@ -8,9 +8,10 @@ Browser ──► Worker (UI + D1 progress) ──► Cloudflare Tunnel ──�
 ```
 
 - **Keep** records the decision only. The file isn't touched.
-- **Delete** depends on `DELETE_MODE` in `worker/wrangler.toml`:
-  - `"mark"` (default): the photo is only added to a **delete list** in the database. Nothing on the drive changes, so a read-only share works fine.
-  - `"move"`: the file is also moved into `_trash/` at the top of its share, keeping its folder structure. Nothing is hard-deleted. Empty `_trash` yourself when you're happy. This needs write access.
+- **Delete** depends on the delete behavior, which you switch under **⚙ Settings** in the app (`DELETE_MODE` in `worker/wrangler.toml` is only the starting value):
+  - **Mark only** (default): the photo is only added to a **delete list** in the database. Nothing on the drive changes, so a read-only share works fine.
+  - **Move to _trash**: the file is also moved into `_trash/` at the top of its share, keeping its folder structure. Nothing is hard-deleted. Empty `_trash` yourself when you're happy. This needs write access.
+- **Apply marked deletions** (Settings): moves everything already marked into `_trash` in one go, whichever mode you're in. Use it when you've finished reviewing and have given the share write access.
 - **Delete list** (button on the folder page): every photo marked for deletion, with thumbnails, newest first. Unmark or restore items individually, or **Download CSV** of the whole list.
 - **Undo** (button, `Z`, or Backspace) clears the last decision, and in `move` mode also puts the file back.
 - A folder shows **done** once every photo still in it has been kept. New photos added later reappear as unreviewed, and the folder flips back to in-progress.
@@ -50,7 +51,17 @@ To review more than one share or folder, mount each one on the LAN machine, then
 CONFIG_FILE=/etc/photo-triage.json API_TOKEN=... node server.js
 ```
 
-Each share then appears as a top-level folder in the app, with its own progress and its own `_trash`. A share name can't contain `/` or start with a dot. Renaming a share changes the paths stored in the database, so pick names you'll keep. The web app can't mount drives itself, because that needs root and your share credentials on the LAN machine.
+Each share then appears as a top-level folder in the app, with its own progress and its own `_trash`. A share name can't contain `/` or start with a dot. Renaming a share changes the paths stored in the database, so pick names you'll keep.
+
+**Adding and removing shares from the app (⚙ Settings → Network shares).** With `CONFIG_FILE` set, the app can edit that file for you:
+
+- The folder picker only offers folders inside `SHARES_BASE` (default `/mnt`), where you mount your drives. Set `SHARES_BASE=/some/dir` in the LAN API's environment to change it.
+- The service user needs write access to the config file.
+- Adding or removing takes effect immediately, with no restart.
+- **Removing a share only removes it from the app.** Nothing is deleted or unmounted, and review progress stays in the database in case you add it back.
+- The app does not mount drives. That needs root and your share password on the LAN machine, so mount new drives yourself (see `deploy/DEBIAN.md`) and then add them in Settings.
+
+**Moving from a single share (`PHOTO_ROOT`) to several.** Paths gain the share name as a prefix, so run `worker/migrations/single-to-multi-share.sql` once against the D1 database if you already reviewed photos, using the same share name as in your config file.
 
 ## 2. Cloudflare Tunnel
 
