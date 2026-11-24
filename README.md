@@ -8,8 +8,11 @@ Browser ──► Worker (UI + D1 progress) ──► Cloudflare Tunnel ──�
 ```
 
 - **Keep** records the decision only. The file isn't touched.
-- **Delete** moves the file into `_trash/` at the top of the share, keeping its folder structure. Nothing is hard-deleted. Empty `_trash` yourself when you're happy.
-- **Undo** (button, `Z`, or Backspace) restores a deleted photo and clears the decision.
+- **Delete** depends on `DELETE_MODE` in `worker/wrangler.toml`:
+  - `"mark"` (default): the photo is only added to a **delete list** in the database. Nothing on the drive changes, so a read-only share works fine.
+  - `"move"`: the file is also moved into `_trash/` at the top of its share, keeping its folder structure. Nothing is hard-deleted. Empty `_trash` yourself when you're happy. This needs write access.
+- **Delete list** (button on the folder page): every photo marked for deletion, with thumbnails, newest first. Unmark or restore items individually, or **Download CSV** of the whole list.
+- **Undo** (button, `Z`, or Backspace) clears the last decision, and in `move` mode also puts the file back.
 - A folder shows **done** once every photo still in it has been kept. New photos added later reappear as unreviewed, and the folder flips back to in-progress.
 - **Resume** jumps to the last folder you were reviewing, from any device.
 
@@ -28,6 +31,26 @@ PHOTO_ROOT=/mnt/photos API_TOKEN=$(openssl rand -hex 32) node server.js
 Keep that token; the Worker needs the same value. Run the service under systemd, pm2 or Docker so it survives reboots. It listens on `127.0.0.1:8787` by default, so run `cloudflared` on the same machine. Set `HOST=0.0.0.0` only if `cloudflared` runs elsewhere.
 
 Without `sharp`, the original files are sent as is. That is slow for full-size camera photos, and HEIC won't display.
+
+### Several shares
+
+To review more than one share or folder, mount each one on the LAN machine, then list them in a JSON file and point the API at it instead of `PHOTO_ROOT`:
+
+```json
+{
+  "shares": {
+    "Camera Archives": "/mnt/photos/Camera Achives",
+    "Dad photos": "/mnt/photos/dad_photos",
+    "Other NAS": "/mnt/other-nas"
+  }
+}
+```
+
+```bash
+CONFIG_FILE=/etc/photo-triage.json API_TOKEN=... node server.js
+```
+
+Each share then appears as a top-level folder in the app, with its own progress and its own `_trash`. A share name can't contain `/` or start with a dot. Renaming a share changes the paths stored in the database, so pick names you'll keep. The web app can't mount drives itself, because that needs root and your share credentials on the LAN machine.
 
 ## 2. Cloudflare Tunnel
 

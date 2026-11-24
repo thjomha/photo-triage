@@ -1,28 +1,62 @@
 // LAN file API for photo-triage. Runs next to the drive (or on any machine that has it mounted).
 // Node 18+. Optional dependency: sharp (thumbnails / resizing / EXIF rotation).
 //
+// Single share:
 //   PHOTO_ROOT=/mnt/photos API_TOKEN=longrandomstring node server.js
+//
+// Several shares (each appears as a top-level folder in the app):
+//   CONFIG_FILE=/etc/photo-triage.json API_TOKEN=... node server.js
+//   where the file looks like { "shares": { "Camera Archives": "/mnt/photos/Camera Achives", "Other": "/mnt/other" } }
 
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
 import { timingSafeEqual } from 'node:crypto';
 
-const ROOT = process.env.PHOTO_ROOT && path.resolve(process.env.PHOTO_ROOT);
 const TOKEN = process.env.API_TOKEN;
 const PORT = Number(process.env.PORT || 8787);
 // Bind to loopback by default: cloudflared on the same machine reaches it there.
 // Set HOST=0.0.0.0 only if cloudflared runs on a different machine.
 const HOST = process.env.HOST || '127.0.0.1';
 
-if (!ROOT || !TOKEN) {
-  console.error('Set PHOTO_ROOT and API_TOKEN environment variables.');
+// ---- shares -------------------------------------------------------------------------------
+// SHARES maps a share name to its absolute root. In single-root mode the only key is '' and
+// paths carry no share prefix. In multi mode every path starts with the share name.
+const SHARES = new Map();
+let MULTI = false;
+
+function loadShares() {
+  if (process.env.CONFIG_FILE) {
+    const cfg = JSON.parse(fsSync.readFileSync(process.env.CONFIG_FILE, 'utf8'));
+    for (const [name, p] of Object.entries(cfg.shares || {})) {
+      if (!name || /[\\/]/.test(name) || name.startsWith('.')) throw new Error(`Invalid share name: "${name}"`);
+      if (typeof p !== 'string' || !p) throw new Error(`Share "${name}" needs a path`);
+      SHARES.set(name, path.resolve(p));
+    }
+    if (!SHARES.size) throw new Error('CONFIG_FILE has no shares');
+    MULTI = true;
+  } else if (process.env.PHOTO_ROOT) {
+    SHARES.set('', path.resolve(process.env.PHOTO_ROOT));
+  } else {
+    throw new Error('Set PHOTO_ROOT (one share) or CONFIG_FILE (several shares).');
+  }
+}
+
+try {
+  if (!TOKEN) throw new Error('Set the API_TOKEN environment variable.');
+  loadShares();
+} catch (e) {
+  console.error(e.message);
   process.exit(1);
 }
 
-const TRASH_NAME = '_trash';
-const TRASH = path.join(ROOT, TRASH_NAME); // inside ROOT so rename() stays on one filesystem
+for (const [name, root] of SHARES) {
+  if (!fsSync.existsSync(root)) console.warn(`[warn] share "${name || 'default'}" path does not exist: ${root}`);
+}
+
+const TRASH_NAME = '_trash'; // lives at the top of each share so rename() stays on one filesystem
 const EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif', '.bmp', '.heic', '.heif']);
 const MIME = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
@@ -52,12 +86,26 @@ function resolveIn(base, rel = '') {
   return abs;
 }
 
-// Resolve inside the photo root and refuse the trash folder and hidden segments.
-function resolvePhotoPath(rel = '') {
-  const abs = resolveIn(ROOT, rel);
-  const parts = path.relative(ROOT, abs).split(path.sep).filter(Boolean);
+const clean = (rel) => String(rel ?? '').replace(/^\/+|\/+$/g, '');
+
+// Split an app path into { root, name, sub }. `sub` is the path inside the share.
+function locate(rel) {
+  rel = clean(rel);
+  if (!MULTI) return { root: SHARES.get(''), name: '', sub: rel };
+  const i = rel.indexOf('/');
+  const name = i < 0 ? rel : rel.slice(0, i);
+  const root = SHARES.get(name);
+  if (!root) throw httpErr(404, 'unknown share');
+  return { root, name, sub: i < 0 ? '' : rel.slice(i + 1) };
+}
+
+// Resolve inside a share, refusing the trash folder and hidden segments.
+function resolvePhotoPath(rel) {
+  const loc = locate(rel);
+  const abs = resolveIn(loc.root, loc.sub);
+  const parts = path.relative(loc.root, abs).split(path.sep).filter(Boolean);
   if (parts.some(isHidden)) throw httpErr(400, 'bad path');
-  return abs;
+  return { ...loc, abs };
 }
 
 function authed(req) {
@@ -108,15 +156,23 @@ async function countPhotos(dir) {
   }
 }
 
+const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+
 const server = http.createServer(async (req, res) => {
   try {
     if (!authed(req)) return send(res, 401, { error: 'unauthorized' });
     const u = new URL(req.url, 'http://x');
-    const rel = (u.searchParams.get('path') ?? '').replace(/^\/+/, '');
+    const rel = clean(u.searchParams.get('path'));
+    const atVirtualRoot = MULTI && !rel;
 
-    // GET /folders?path=  -> immediate subfolders with the number of photos directly inside each
+    // GET /folders?path=  -> immediate subfolders with the number of photos directly inside each.
+    // In multi-share mode the top level lists the shares.
     if (req.method === 'GET' && u.pathname === '/folders') {
-      const dir = resolvePhotoPath(rel);
+      if (atVirtualRoot) {
+        const folders = [...SHARES.keys()].sort(byName).map((n) => ({ name: n, path: n, photoCount: 0 }));
+        return send(res, 200, { path: '', photoCount: 0, folders });
+      }
+      const { abs: dir } = resolvePhotoPath(rel);
       const entries = await fs.readdir(dir, { withFileTypes: true });
       const dirs = entries.filter((e) => e.isDirectory() && !isHidden(e.name));
       const folders = [];
@@ -129,22 +185,22 @@ const server = http.createServer(async (req, res) => {
           photoCount: counts[j],
         }));
       }
-      folders.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+      folders.sort((a, b) => byName(a.name, b.name));
       return send(res, 200, { path: rel, photoCount: await countPhotos(dir), folders });
     }
 
     // GET /photos?path=  -> file names of photos directly inside the folder
     if (req.method === 'GET' && u.pathname === '/photos') {
-      const dir = resolvePhotoPath(rel);
+      if (atVirtualRoot) return send(res, 200, { path: '', photos: [] });
+      const { abs: dir } = resolvePhotoPath(rel);
       const entries = await fs.readdir(dir, { withFileTypes: true });
-      const photos = entries.filter((e) => e.isFile() && isPhoto(e.name)).map((e) => e.name)
-        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      const photos = entries.filter((e) => e.isFile() && isPhoto(e.name)).map((e) => e.name).sort(byName);
       return send(res, 200, { path: rel, photos });
     }
 
     // GET /img?path=&w=  -> the image, optionally resized
     if (req.method === 'GET' && u.pathname === '/img') {
-      const file = resolvePhotoPath(rel);
+      const { abs: file } = resolvePhotoPath(rel);
       const ext = path.extname(file).toLowerCase();
       if (!EXT.has(ext)) throw httpErr(400, 'not an image');
       const st = await fs.stat(file);
@@ -163,31 +219,35 @@ const server = http.createServer(async (req, res) => {
       return stream.pipe(res);
     }
 
-    // POST /delete {path}  -> move the photo into _trash (never a hard delete)
+    // POST /delete {path}  -> move the photo into the share's _trash folder (never a hard delete).
+    // The Worker only calls this when DELETE_MODE = "move".
     if (req.method === 'POST' && u.pathname === '/delete') {
       const body = await readJson(req);
-      const file = resolvePhotoPath(String(body.path || ''));
+      const { abs: file, root, name, sub } = resolvePhotoPath(String(body.path || ''));
       if (!isPhoto(path.basename(file))) throw httpErr(400, 'not a photo');
       const st = await fs.stat(file).catch(() => null);
       if (!st?.isFile()) throw httpErr(404, 'not found');
-      const relPath = path.relative(ROOT, file);
-      let dest = path.join(TRASH, relPath);
+      const trashRoot = path.join(root, TRASH_NAME);
+      let dest = path.join(trashRoot, sub);
       if (await exists(dest)) {
-        const { dir, name, ext } = path.parse(dest);
-        dest = path.join(dir, `${name}.${Date.now()}${ext}`);
+        const { dir, name: base, ext } = path.parse(dest);
+        dest = path.join(dir, `${base}.${Date.now()}${ext}`);
       }
       await moveFile(file, dest);
-      return send(res, 200, { trashed: path.relative(TRASH, dest).split(path.sep).join('/') });
+      const inTrash = path.relative(trashRoot, dest).split(path.sep).join('/');
+      return send(res, 200, { trashed: MULTI ? `${name}/${inTrash}` : inTrash });
     }
 
     // POST /restore {trashed, path}  -> undo a delete
     if (req.method === 'POST' && u.pathname === '/restore') {
       const body = await readJson(req);
-      const src = resolveIn(TRASH, String(body.trashed || ''));
-      const dest = resolvePhotoPath(String(body.path || ''));
+      const t = locate(String(body.trashed || ''));
+      const target = resolvePhotoPath(String(body.path || ''));
+      if (t.root !== target.root) throw httpErr(400, 'share mismatch');
+      const src = resolveIn(path.join(t.root, TRASH_NAME), t.sub);
       if (!(await exists(src))) throw httpErr(404, 'not in trash');
-      if (await exists(dest)) throw httpErr(409, 'a file already exists at the original location');
-      await moveFile(src, dest);
+      if (await exists(target.abs)) throw httpErr(409, 'a file already exists at the original location');
+      await moveFile(src, target.abs);
       return send(res, 200, { ok: true });
     }
 
@@ -200,4 +260,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => console.log(`photo-triage LAN API on http://${HOST}:${PORT}, root ${ROOT}`));
+server.listen(PORT, HOST, () => {
+  const list = [...SHARES].map(([n, r]) => `${n || 'default'} -> ${r}`).join(', ');
+  console.log(`photo-triage LAN API on http://${HOST}:${PORT} (${list})`);
+});

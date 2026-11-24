@@ -54,6 +54,13 @@ curl -s -H "Authorization: Bearer $(grep API_TOKEN /etc/photo-triage.env | cut -
 
 You should see JSON listing your top-level folders. If the Debian "instance" is a container with no systemd, run `node server.js` under pm2 or Docker instead.
 
+## Adding more shares later
+
+1. Mount the new share, with another line in `/etc/fstab` and its own mount point, for example `/mnt/other-nas`. Run `sudo mount -a` and check it with `ls`.
+2. Create `/etc/photo-triage.json` listing every share you want in the app (see the main README, "Several shares").
+3. In `/etc/photo-triage.env`, delete the `PHOTO_ROOT=` line and add `CONFIG_FILE=/etc/photo-triage.json`.
+4. `sudo systemctl restart photo-triage-lan`, then reload the app. Each share now shows as a top-level folder.
+
 ## 3. Cloudflare Tunnel
 
 1. Cloudflare dashboard, **Zero Trust → Networks → Tunnels → Create a tunnel** (type: Cloudflared). Name it `photo-triage`.

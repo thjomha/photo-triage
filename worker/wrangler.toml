@@ -15,6 +15,9 @@ database_id = "647dd103-a778-4ae9-ada3-0916e14751c9"
 [vars]
 # Public hostname of your tunnel, e.g. https://photos-api.example.com
 LAN_API_URL = "https://photos.tahajomha.com"
+# "mark": Delete only records the photo in the database (nothing on the drive changes).
+# "move": Delete also moves the file into _trash on the share (needs write access).
+DELETE_MODE = "mark"
 
 # Secrets (set with `wrangler secret put`):
 #   LAN_API_TOKEN            required, must match API_TOKEN on the LAN API

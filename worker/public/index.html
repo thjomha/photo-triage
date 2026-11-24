@@ -49,6 +49,15 @@
            padding:10px 16px; border-radius:10px; z-index:10; display:none; max-width:90%; }
   .hint { font-size:12px; color:var(--dim); text-align:center; padding-bottom:6px; }
   @media (hover:none) { .hint.kbd { display:none; } }
+  .note { background:#1f2a3d; border:1px solid #33496d; color:#b9c8e3; padding:8px 12px; border-radius:10px;
+          font-size:13px; margin-bottom:12px; }
+  .small { font-size:12px; }
+  .mrow { display:flex; align-items:center; gap:12px; padding:8px; background:var(--panel);
+          border:1px solid var(--line); border-radius:10px; margin-bottom:6px; }
+  .mrow img { width:64px; height:64px; object-fit:cover; border-radius:6px; background:#000; display:block; }
+  .minfo { flex:1; min-width:0; }
+  .mname { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .minfo .muted { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 </style>
 </head>
 <body>
@@ -76,19 +85,23 @@ function toast(msg) {
 }
 
 /* ---------- routing: #browse:<path> or #review:<path> ---------- */
+let CONFIG = { deleteMode: 'mark' };
+const configP = api('config').then((c) => (CONFIG = c)).catch(() => CONFIG);
+const markMode = () => CONFIG.deleteMode !== 'move';
+
 function go(mode, path) { location.hash = mode + ':' + encodeURIComponent(path); }
 window.addEventListener('hashchange', route);
 function route() {
-  const m = /^#(browse|review):(.*)$/.exec(location.hash);
+  const m = /^#(browse|review|marked):(.*)$/.exec(location.hash);
   const mode = m ? m[1] : 'browse';
   const path = m ? decodeURIComponent(m[2]) : '';
-  (mode === 'review' ? reviewView : browseView)(path);
+  configP.then(() => ({ review: reviewView, marked: markedView }[mode] || browseView)(path));
 }
 
 /* ---------- browse ---------- */
 const badge = (f) => {
   if (f.status === 'done') return '<span class="badge done">✓ done</span>';
-  if (f.status === 'partial') return `<span class="badge partial">${f.kept + f.deleted}/${f.photoCount + f.deleted} reviewed</span>`;
+  if (f.status === 'partial') return `<span class="badge partial">${f.kept + f.deleted}/${f.photoCount + f.deleted - f.marked} reviewed</span>`;
   if (f.status === 'new') return `<span class="badge new">${f.photoCount} new</span>`;
   if (f.reviewedInside) return `<span class="badge partial">${f.reviewedInside} reviewed inside</span>`;
   return '';
@@ -104,14 +117,18 @@ async function browseView(path) {
     const crumbs = ['<a data-p="">Root</a>'].concat(parts.map((p) => {
       acc += (acc ? '/' : '') + p; return `<span>/</span><a data-p="${esc(acc)}">${esc(p)}</a>`;
     }));
-    const pending = d.photoCount - d.kept;
-    let html = `<div class="crumbs">${crumbs.join('')}</div><div class="bar">`;
+    const pending = d.photoCount - d.kept - d.marked;
+    let html = '';
+    if (markMode()) html += '<div class="note">Mark-only mode: “delete” just adds a photo to the delete list. Nothing is removed from the drive.</div>';
+    html += `<div class="crumbs">${crumbs.join('')}</div><div class="bar">`;
     if (resume.folder !== null && resume.folder !== path)
       html += `<button class="primary" id="resume">↩ Resume: ${esc(resume.folder || 'Root')}</button>`;
     if (d.photoCount > 0)
       html += pending > 0
         ? `<button class="primary" id="start">Review ${pending} photo${pending === 1 ? '' : 's'} here</button>`
         : `<span class="badge done">✓ all photos in this folder reviewed</span>`;
+    html += `<button id="dellist">🗑 Delete list (${d.deleteListTotal})</button>`;
+    if (path) html += '<button id="dellist-here">This folder’s list</button>';
     html += '</div>';
     html += d.folders.length
       ? '<div class="list">' + d.folders.map((f) =>
@@ -121,6 +138,8 @@ async function browseView(path) {
     $app.querySelectorAll('[data-p]').forEach((el) => el.addEventListener('click', () => go('browse', el.dataset.p)));
     $app.querySelector('#start')?.addEventListener('click', () => go('review', path));
     $app.querySelector('#resume')?.addEventListener('click', () => go('review', resume.folder));
+    $app.querySelector('#dellist')?.addEventListener('click', () => go('marked', ''));
+    $app.querySelector('#dellist-here')?.addEventListener('click', () => go('marked', path));
   } catch (e) {
     $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="route()">Retry</button>`;
   }
@@ -162,9 +181,10 @@ function renderReview() {
       <header><button id="back">← Folders</button><span class="t">${esc(title)}</span><span>${left} left</span></header>
       <div id="stage"></div>
       <div class="hint kbd">→ / K keep · ← / D delete · Z undo · Esc back &nbsp;|&nbsp; swipe right = keep, left = delete</div>
+      ${markMode() ? '<div class="hint">Deleting only marks the photo. Nothing is removed from the drive.</div>' : ''}
       <div id="actions">
         <button class="undo" id="undo" title="Undo (Z)">↶</button>
-        <button class="del" id="del">🗑 Delete</button>
+        <button class="del" id="del">${markMode() ? '🗑 Mark delete' : '🗑 Delete'}</button>
         <button class="keep" id="keep">✓ Keep</button>
       </div>
     </div>`;
@@ -248,6 +268,71 @@ function attachSwipe(el) {
     x0 = null;
     if (Math.abs(dx) > 80 && Math.abs(dx) > Math.abs(dy) * 1.5) decide(dx > 0 ? 'keep' : 'delete');
   });
+}
+
+/* ---------- delete list ---------- */
+const PAGE = 60;
+
+async function markedView(path) {
+  cleanupReview();
+  $app.innerHTML = '<p class="muted">Loading…</p>';
+  let total = 0, offset = 0;
+  const scope = path ? ` in ${esc(path)}` : '';
+  const csvHref = '/api/marked.csv?' + q(path);
+
+  const rowHtml = (it) => {
+    const i = it.path.lastIndexOf('/');
+    const folder = i >= 0 ? it.path.slice(0, i) : '';
+    const name = it.path.slice(i + 1);
+    const when = new Date(it.decidedAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+    return `<div class="mrow" data-p="${esc(it.path)}">
+      <a href="${imgUrl(it.path)}" target="_blank" rel="noopener"><img loading="lazy" alt="" src="/api/img?w=200&${q(it.path)}"></a>
+      <div class="minfo"><div class="mname">${esc(name)}</div>
+        <div class="muted small">${esc(folder || 'Root')} · ${esc(when)}${it.moved ? ' · moved to _trash' : ''}</div></div>
+      <button class="unmark">${it.moved ? 'Restore' : 'Unmark'}</button></div>`;
+  };
+
+  const draw = (items, append) => {
+    const list = document.getElementById('mlist');
+    if (!append) list.innerHTML = '';
+    list.insertAdjacentHTML('beforeend', items.map(rowHtml).join(''));
+    document.getElementById('mcount').textContent = total + ' photo' + (total === 1 ? '' : 's');
+    document.getElementById('more').style.display = offset < total ? '' : 'none';
+    document.getElementById('empty').style.display = total === 0 ? '' : 'none';
+  };
+
+  const load = async (append) => {
+    const d = await api(`marked?${q(path)}&limit=${PAGE}&offset=${offset}`);
+    total = d.total;
+    offset += d.items.length;
+    draw(d.items, append);
+  };
+
+  $app.innerHTML = `
+    <div class="crumbs"><a id="back">← Folders</a></div>
+    <h2 style="margin:0 0 4px">Delete list${scope}</h2>
+    <p class="muted" style="margin:0 0 12px"><span id="mcount"></span> ·
+      <a href="${csvHref}" style="color:var(--accent)">Download CSV</a></p>
+    <div id="empty" class="muted" style="display:none">Nothing marked for deletion.</div>
+    <div id="mlist"></div>
+    <div class="bar" style="margin-top:12px"><button id="more" style="display:none">Load more</button></div>`;
+  document.getElementById('back').onclick = () => go('browse', path);
+  document.getElementById('more').onclick = () => load(true).catch((e) => toast(e.message));
+  document.getElementById('mlist').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.unmark');
+    if (!btn) return;
+    const row = btn.closest('.mrow');
+    btn.disabled = true;
+    try {
+      await post('undo', { path: row.dataset.p });
+      row.remove();
+      total--; offset--;
+      document.getElementById('mcount').textContent = total + ' photo' + (total === 1 ? '' : 's');
+      if (total === 0) document.getElementById('empty').style.display = '';
+    } catch (err) { btn.disabled = false; toast('Could not undo: ' + err.message); }
+  });
+  try { await load(false); }
+  catch (e) { $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="route()">Retry</button>`; }
 }
 
 route();

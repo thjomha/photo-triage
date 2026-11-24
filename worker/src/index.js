@@ -1,11 +1,16 @@
 // Cloudflare Worker: serves the UI, stores review progress in D1, and talks to the LAN file API
 // through a Cloudflare Tunnel.
+//
+// DELETE_MODE (wrangler.toml [vars]):
+//   "mark" (default)  "Delete" only records the photo in D1. Nothing on the drive changes.
+//   "move"            "Delete" also moves the file into _trash on the share (needs write access).
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
 const dirname = (p) => (p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '');
 const esc = (s) => s.replace(/[\\%_]/g, '\\$&'); // escape LIKE wildcards
+const deleteMode = (env) => (env.DELETE_MODE === 'move' ? 'move' : 'mark');
 
 function lan(env, path, init = {}) {
   const headers = new Headers(init.headers);
@@ -38,6 +43,17 @@ async function setMeta(env, key, value) {
     .bind(key, value).run();
 }
 
+// Marked-for-delete query shared by the JSON list and the CSV export.
+function markedQuery(path) {
+  const prefix = path ? path + '/' : '';
+  return {
+    where: `decision = 'delete' AND (?1 = '' OR path LIKE ?2 ESCAPE '\\')`,
+    args: [path, esc(prefix) + '%'],
+  };
+}
+
+const csvCell = (v) => `"${String(v).replace(/"/g, '""')}"`;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -47,6 +63,8 @@ export default {
       const route = `${request.method} ${url.pathname}`;
       const path = (url.searchParams.get('path') ?? '').replace(/^\/+|\/+$/g, '');
 
+      if (route === 'GET /api/config') return json({ deleteMode: deleteMode(env) });
+
       // Folder browser: LAN folder list merged with review progress from D1.
       if (route === 'GET /api/folders') {
         const lanData = await lanJson(env, `/folders?path=${encodeURIComponent(path)}`);
@@ -54,46 +72,53 @@ export default {
         const { results } = await env.DB.prepare(
           `SELECT folder,
                   SUM(decision = 'keep') AS kept,
-                  SUM(decision = 'delete') AS deleted
+                  SUM(decision = 'delete') AS deleted,
+                  SUM(decision = 'delete' AND trashed IS NULL) AS marked
              FROM decisions
             WHERE folder = ?1 OR folder LIKE ?2 ESCAPE '\\'
             GROUP BY folder`,
         ).bind(path, esc(prefix) + '%').all();
+        const totalRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM decisions WHERE decision = 'delete'").first();
 
-        const direct = new Map(); // folder path -> {kept, deleted}
+        const direct = new Map(); // folder path -> {kept, deleted, marked}
         const deep = new Map();   // child folder path -> reviewed count somewhere below it
         for (const r of results) {
-          direct.set(r.folder, { kept: r.kept, deleted: r.deleted });
+          direct.set(r.folder, { kept: r.kept, deleted: r.deleted, marked: r.marked });
           if (r.folder !== path) {
             const child = prefix + r.folder.slice(prefix.length).split('/')[0];
             deep.set(child, (deep.get(child) || 0) + r.kept + r.deleted);
           }
         }
 
+        // "marked" photos are still on the drive, so they count towards what's left to review.
         const status = (photoCount, d) => {
-          const kept = d?.kept || 0, deleted = d?.deleted || 0;
-          if (photoCount > 0 && kept >= photoCount) return 'done';
+          const kept = d?.kept || 0, deleted = d?.deleted || 0, marked = d?.marked || 0;
+          if (photoCount > 0 && kept + marked >= photoCount) return 'done';
           if (kept + deleted > 0) return 'partial';
           return photoCount > 0 ? 'new' : 'empty';
         };
+        const zero = { kept: 0, deleted: 0, marked: 0 };
 
         const folders = lanData.folders.map((f) => {
-          const d = direct.get(f.path) || { kept: 0, deleted: 0 };
+          const d = direct.get(f.path) || zero;
           return {
             ...f,
             kept: d.kept,
             deleted: d.deleted,
+            marked: d.marked,
             reviewedInside: deep.get(f.path) || 0,
             status: status(f.photoCount, d),
           };
         });
-        const self = direct.get(path) || { kept: 0, deleted: 0 };
+        const self = direct.get(path) || zero;
         return json({
           path,
           photoCount: lanData.photoCount,
           kept: self.kept,
           deleted: self.deleted,
+          marked: self.marked,
           status: status(lanData.photoCount, self),
+          deleteListTotal: totalRow.c,
           folders,
         });
       }
@@ -133,7 +158,7 @@ export default {
         const { path: p, decision } = await request.json();
         if (!p || !['keep', 'delete'].includes(decision)) return json({ error: 'bad request' }, 400);
         let trashed = null;
-        if (decision === 'delete') {
+        if (decision === 'delete' && deleteMode(env) === 'move') {
           // Move on the LAN first; only record the decision if that worked.
           trashed = (await lanJson(env, '/delete', post({ path: p }))).trashed;
         }
@@ -146,6 +171,7 @@ export default {
         return json({ ok: true });
       }
 
+      // Undo a decision: puts a moved file back (move mode) and clears the record.
       if (route === 'POST /api/undo') {
         const { path: p } = await request.json();
         const row = await env.DB.prepare('SELECT decision, trashed FROM decisions WHERE path = ?1').bind(p).first();
@@ -155,6 +181,42 @@ export default {
         }
         await env.DB.prepare('DELETE FROM decisions WHERE path = ?1').bind(p).run();
         return json({ ok: true });
+      }
+
+      // The delete list: every photo marked for deletion, newest first. ?path= limits to a folder tree.
+      if (route === 'GET /api/marked') {
+        const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500);
+        const offset = Math.max(Number(url.searchParams.get('offset')) || 0, 0);
+        const { where, args } = markedQuery(path);
+        const total = await env.DB.prepare(`SELECT COUNT(*) AS c FROM decisions WHERE ${where}`).bind(...args).first();
+        const { results } = await env.DB.prepare(
+          `SELECT path, decided_at, (trashed IS NOT NULL) AS moved
+             FROM decisions WHERE ${where}
+            ORDER BY decided_at DESC, path
+            LIMIT ?3 OFFSET ?4`,
+        ).bind(...args, limit, offset).all();
+        return json({
+          total: total.c,
+          offset,
+          items: results.map((r) => ({ path: r.path, decidedAt: r.decided_at, moved: !!r.moved })),
+        });
+      }
+
+      if (route === 'GET /api/marked.csv') {
+        const { where, args } = markedQuery(path);
+        const { results } = await env.DB.prepare(
+          `SELECT path, decided_at, (trashed IS NOT NULL) AS moved
+             FROM decisions WHERE ${where} ORDER BY path LIMIT 100000`,
+        ).bind(...args).all();
+        const lines = ['path,marked_at,moved_to_trash'].concat(
+          results.map((r) => [csvCell(r.path), new Date(r.decided_at).toISOString(), r.moved ? 'yes' : 'no'].join(',')),
+        );
+        return new Response(lines.join('\r\n') + '\r\n', {
+          headers: {
+            'content-type': 'text/csv; charset=utf-8',
+            'content-disposition': 'attachment; filename="delete-list.csv"',
+          },
+        });
       }
 
       if (route === 'GET /api/resume') {
