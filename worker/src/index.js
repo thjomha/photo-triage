@@ -196,16 +196,17 @@ export default {
           lanJson(env, `/photos?path=${encodeURIComponent(path)}`),
           env.DB.prepare('SELECT path, decision FROM decisions WHERE folder = ?1').bind(path).all(),
         ]);
-        const done = new Set(decided.results.map((r) => r.path));
+        const decisions = new Map(decided.results.map((r) => [r.path, r.decision]));
         const prefix = path ? path + '/' : '';
-        const pending = lanData.photos.filter((n) => !done.has(prefix + n));
         await setMeta(env, 'last_folder', path);
+        // Every photo on the drive in order, each with its decision (null = not reviewed yet), so the
+        // review screen can browse back and forth and show what was already decided.
         return json({
           path,
           total: lanData.photos.length,
           kept: decided.results.filter((r) => r.decision === 'keep').length,
           deleted: decided.results.filter((r) => r.decision === 'delete').length,
-          pending: pending.map((n) => prefix + n),
+          photos: lanData.photos.map((n) => ({ path: prefix + n, decision: decisions.get(prefix + n) || null })),
         });
       }
 
@@ -225,7 +226,13 @@ export default {
         const { path: p, decision } = await request.json();
         if (!p || !['keep', 'delete'].includes(decision)) return json({ error: 'bad request' }, 400);
         let trashed = null;
-        if (decision === 'delete' && (await getDeleteMode(env)).mode === 'move') {
+        // The photo may have been decided before (people go back and change their mind).
+        const existing = await env.DB.prepare('SELECT decision, trashed FROM decisions WHERE path = ?1').bind(p).first();
+        if (existing && existing.decision === 'delete' && existing.trashed) {
+          if (decision === 'delete') return json({ ok: true }); // already moved to _trash
+          // Changed to keep: put the file back first, and only record the change if that worked.
+          await lanJson(env, '/restore', post({ trashed: existing.trashed, path: p }));
+        } else if (decision === 'delete' && (await getDeleteMode(env)).mode === 'move') {
           // Move on the LAN first; only record the decision if that worked.
           trashed = (await lanJson(env, '/delete', post({ path: p }))).trashed;
         }

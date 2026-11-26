@@ -7,6 +7,10 @@ Progress is stored in Cloudflare D1, so you can stop on your phone and resume on
 Browser ──► Worker (UI + D1 progress) ──► Cloudflare Tunnel ──► lan-api (Node) ──► photo drive
 ```
 
+- **Browsing and deciding are separate.** `←` / `→` (or the ‹ › buttons, or a swipe on a phone) move between photos without deciding anything. `K` keeps and `D` deletes the photo on screen, then moves on to the next unreviewed one (switch off "auto-advance" to stay put). `Z` undoes, `N` jumps to the next unreviewed photo, `F` opens the full-size original, `Esc` goes back.
+- **Filmstrip.** Thumbnails of the neighbouring photos run along the bottom, so you can compare similar takes at a glance. Click one to jump to it. A green bar means kept, and a grey thumbnail with a red bar means marked for deletion. You can go back to any photo and change your mind.
+- **Speed.** The next 8 full-size photos and the next ~28 thumbnails are fetched in the background while you work.
+- When a folder is finished, **Next: …** takes you straight to the next unreviewed sibling folder.
 - **Keep** records the decision only. The file isn't touched.
 - **Delete** depends on the delete behavior, which you switch under **⚙ Settings** in the app (`DELETE_MODE` in `worker/wrangler.toml` is only the starting value):
   - **Mark only** (default): the photo is only added to a **delete list** in the database. Nothing on the drive changes, so a read-only share works fine.

@@ -32,19 +32,35 @@
   .err { background:#3a1c20; border:1px solid var(--del); padding:10px 14px; border-radius:10px; margin-bottom:12px; }
   /* review */
   #review { position:fixed; inset:0; display:flex; flex-direction:column; background:#000; touch-action:pan-y; }
-  #review header { display:flex; justify-content:space-between; align-items:center; gap:10px;
-                   padding:calc(10px + env(safe-area-inset-top)) 14px 10px; color:var(--dim); font-size:14px; }
-  #review header .t { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #review header { display:flex; align-items:center; gap:10px; padding:calc(8px + env(safe-area-inset-top)) 12px 8px;
+                   color:var(--dim); font-size:14px; }
+  #review header .t { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #review header button { padding:6px 12px; }
   #stage { flex:1; min-height:0; display:flex; align-items:center; justify-content:center; position:relative; }
-  #stage img { max-width:100%; max-height:100%; object-fit:contain; transition:transform .15s, opacity .15s; }
+  #stage img#main { max-width:100%; max-height:100%; object-fit:contain; }
   #stage .fname { position:absolute; bottom:8px; left:0; right:0; text-align:center; font-size:12px; color:var(--dim);
                   text-shadow:0 1px 3px #000; pointer-events:none; }
+  #stage .chip { position:absolute; top:8px; left:8px; padding:4px 12px; border-radius:99px; font-size:13px;
+                 font-weight:600; display:none; }
+  #stage .chip.keep { background:var(--keep); display:block; } #stage .chip.del { background:var(--del); display:block; }
   #stage .flash { position:absolute; inset:0; pointer-events:none; opacity:0; transition:opacity .2s; }
-  #actions { display:flex; gap:10px; padding:12px 14px calc(12px + env(safe-area-inset-bottom)); }
-  #actions button { flex:1; padding:16px 10px; font-size:18px; font-weight:600; border:0; }
+  #done { position:absolute; inset:0; background:rgba(0,0,0,.88); display:none; align-items:center; justify-content:center; }
+  #strip { position:relative; display:flex; gap:6px; overflow-x:auto; padding:8px 12px; background:#0b0c0e; scrollbar-width:thin; scrollbar-color:#3a404b #0b0c0e; }
+  .th { position:relative; flex:0 0 auto; width:84px; height:63px; border-radius:6px; overflow:hidden;
+        border:2px solid transparent; cursor:pointer; opacity:.7; background:#1d2026; }
+  .th img { width:100%; height:100%; object-fit:cover; display:block; }
+  .th.cur { border-color:var(--accent); opacity:1; }
+  .th.keep::after, .th.del::after { content:''; position:absolute; left:0; right:0; bottom:0; height:5px; }
+  .th.keep::after { background:var(--keep); } .th.del::after { background:var(--del); }
+  .th.del img { filter:grayscale(1) brightness(.55); }
+  #actions { display:flex; gap:8px; padding:8px 12px calc(10px + env(safe-area-inset-bottom)); }
+  #actions button { flex:1; padding:14px 8px; font-size:17px; font-weight:600; border:0; white-space:nowrap; }
+  #actions .nav { flex:0 0 52px; background:var(--panel); font-weight:400; font-size:24px; padding:8px 0; }
   #actions .del { background:var(--del); } #actions .keep { background:var(--keep); }
-  #actions .undo { flex:0 0 64px; background:var(--panel); font-weight:400; }
-  .center { text-align:center; padding:60px 20px; }
+  .opts { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:2px 12px 0;
+          font-size:12px; color:var(--dim); }
+  .opts label { white-space:nowrap; cursor:pointer; }
+  .center { text-align:center; padding:40px 20px; }
   #toast { position:fixed; left:50%; bottom:90px; transform:translateX(-50%); background:#3a1c20; border:1px solid var(--del);
            padding:10px 16px; border-radius:10px; z-index:10; display:none; max-width:90%; }
   .hint { font-size:12px; color:var(--dim); text-align:center; padding-bottom:6px; }
@@ -156,10 +172,20 @@ async function browseView(path) {
 
 /* ---------- review ---------- */
 let R = null; // review state
+const BIG = (p) => imgUrl(p);
+const THUMB = (p) => '/api/img?w=200&' + q(p);
+const AHEAD = 8, BEHIND = 2, THUMBS_BEHIND = 8, THUMBS_AHEAD = 28;
+const imgCache = new Map(); // url -> Image, keeps preloaded pictures alive
+
+const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch { return d; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
 
 function cleanupReview() {
   if (R) { window.removeEventListener('keydown', R.onKey); R = null; }
+  imgCache.clear();
 }
+
+function leave() { go('browse', R ? R.path : ''); }
 
 async function reviewView(path) {
   cleanupReview();
@@ -167,95 +193,244 @@ async function reviewView(path) {
   let d;
   try { d = await api('photos?' + q(path)); }
   catch (e) { $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="history.back()">Back</button>`; return; }
-
-  R = { path, queue: d.pending.slice(), history: [], kept: d.kept, deleted: d.deleted, chain: Promise.resolve(), busy: false };
-  R.onKey = (e) => {
-    if (e.target.tagName === 'INPUT') return;
-    if (e.key === 'ArrowRight' || e.key === 'k') decide('keep');
-    else if (e.key === 'ArrowLeft' || e.key === 'd' || e.key === 'Delete') decide('delete');
-    else if (e.key === 'z' || e.key === 'Backspace') undo();
-    else if (e.key === 'Escape') leave();
+  if (!d.photos.length) {
+    $app.innerHTML = '<div class="center"><p class="muted">No photos in this folder.</p><button onclick="history.back()">Back</button></div>';
+    return;
+  }
+  R = {
+    path, items: d.photos.map((x) => ({ p: x.path, d: x.decision })), idx: 0, history: [],
+    chain: Promise.resolve(), auto: lsGet('autoAdvance', '1') === '1', showDone: false, thumbsSet: new Set(),
   };
+  const first = R.items.findIndex((x) => !x.d);
+  R.idx = first >= 0 ? first : 0;
+  R.showDone = first < 0;
+  R.onKey = onReviewKey;
   window.addEventListener('keydown', R.onKey);
+  prevIdx = -1;
   renderReview();
 }
 
-function leave() { go('browse', R ? R.path : ''); }
+function onReviewKey(e) {
+  if (!R || e.ctrlKey || e.metaKey || e.altKey || e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  if (k === 'arrowright' || k === ' ') { e.preventDefault(); move(1); }
+  else if (k === 'arrowleft') { e.preventDefault(); move(-1); }
+  else if (k === 'home') { e.preventDefault(); jump(0); }
+  else if (k === 'end') { e.preventDefault(); jump(R.items.length - 1); }
+  else if (k === 'k') decide('keep');
+  else if (k === 'd' || k === 'delete') decide('delete');
+  else if (k === 'z' || k === 'backspace') undo();
+  else if (k === 'n') jumpNextUndecided();
+  else if (k === 'f') openFull();
+  else if (k === 'escape') leave();
+}
+
+const undecidedCount = () => R.items.reduce((n, it) => n + (it.d ? 0 : 1), 0);
 
 function renderReview() {
-  const left = R.queue.length;
-  const title = R.path || 'Root';
+  const mm = markMode();
   $app.innerHTML = `
     <div id="review">
-      <header><button id="back">← Folders</button><span class="t">${esc(title)}</span><span>${left} left</span></header>
-      <div id="stage"></div>
-      <div class="hint kbd">→ / K keep · ← / D delete · Z undo · Esc back &nbsp;|&nbsp; swipe right = keep, left = delete</div>
-      ${markMode() ? '<div class="hint">Deleting only marks the photo. Nothing is removed from the drive.</div>' : ''}
+      <header><button id="back">← Folders</button><span class="t">${esc(R.path || 'Root')}</span>
+        <span id="count"></span><button id="undo" title="Undo (Z)">↶</button></header>
+      <div id="stage"><img id="main" alt=""><div class="chip" id="chip"></div><div class="fname" id="fname"></div>
+        <div id="done"></div></div>
+      <div id="strip">${R.items.map((_, i) => `<div class="th" data-i="${i}"></div>`).join('')}</div>
+      <div class="opts"><span class="hint kbd" style="padding:0">← → browse · K keep · D delete · Z undo · N next unreviewed · F full size</span>
+        <label><input type="checkbox" id="aa" ${R.auto ? 'checked' : ''}> auto-advance after K / D</label></div>
+      ${mm ? '<div class="hint" style="padding-top:4px">Delete only marks the photo. Nothing is removed from the drive.</div>' : ''}
       <div id="actions">
-        <button class="undo" id="undo" title="Undo (Z)">↶</button>
-        <button class="del" id="del">${markMode() ? '🗑 Mark delete' : '🗑 Delete'}</button>
-        <button class="keep" id="keep">✓ Keep</button>
+        <button class="nav" id="prev" title="Previous (←)">‹</button>
+        <button class="del" id="bdel" title="D">🗑 Delete</button>
+        <button class="keep" id="bkeep" title="K">✓ Keep</button>
+        <button class="nav" id="next" title="Next (→)">›</button>
       </div>
     </div>`;
-  document.getElementById('back').onclick = leave;
-  document.getElementById('del').onclick = () => decide('delete');
-  document.getElementById('keep').onclick = () => decide('keep');
-  document.getElementById('undo').onclick = undo;
-  attachSwipe(document.getElementById('stage'));
-  showCurrent();
-}
-
-function showCurrent() {
-  const stage = document.getElementById('stage');
-  if (!stage) return;
-  const hdr = document.querySelector('#review header span:last-child');
-  if (hdr) hdr.textContent = R.queue.length + ' left';
-  document.getElementById('undo').disabled = R.history.length === 0;
-
-  if (R.queue.length === 0) {
-    stage.innerHTML = `<div class="center"><h2>Folder done ✓</h2>
-      <p class="muted">${R.kept} kept · ${R.deleted} deleted</p>
-      <button class="primary" id="finish">Back to folders</button></div>`;
-    document.getElementById('finish').onclick = leave;
-    document.getElementById('keep').disabled = document.getElementById('del').disabled = true;
-    return;
-  }
-  document.getElementById('keep').disabled = document.getElementById('del').disabled = false;
-  const cur = R.queue[0];
-  stage.innerHTML = `<img alt="" src="${imgUrl(cur)}"><div class="fname">${esc(cur.split('/').pop())}</div>`;
-  const img = stage.querySelector('img');
-  img.onerror = () => toast('Could not load this image. Press the key again to skip it, or reload.');
-  R.queue.slice(1, 4).forEach((p) => { new Image().src = imgUrl(p); }); // preload next few
-}
-
-// Optimistic: advance immediately, sync with the server in order in the background.
-function decide(decision) {
-  if (!R || R.queue.length === 0) return;
-  const p = R.queue.shift();
-  R.history.push({ path: p, decision });
-  decision === 'keep' ? R.kept++ : R.deleted++;
-  const state = R;
-  state.chain = state.chain.then(() => post('decide', { path: p, decision })).catch((e) => {
-    toast('Failed to save ' + p.split('/').pop() + ': ' + e.message);
-    // put it back so nothing is silently lost
-    const i = state.history.findIndex((h) => h.path === p);
-    if (i >= 0) state.history.splice(i, 1);
-    decision === 'keep' ? state.kept-- : state.deleted--;
-    state.queue.unshift(p);
-    if (R === state) showCurrent();
+  const $ = (id) => document.getElementById(id);
+  $('back').onclick = leave;
+  $('undo').onclick = undo;
+  $('prev').onclick = () => move(-1);
+  $('next').onclick = () => move(1);
+  $('bdel').onclick = () => decide('delete');
+  $('bkeep').onclick = () => decide('keep');
+  $('aa').onchange = (e) => { R.auto = e.target.checked; lsSet('autoAdvance', R.auto ? '1' : '0'); };
+  $('strip').addEventListener('click', (e) => {
+    const t = e.target.closest('.th');
+    if (t) jump(Number(t.dataset.i));
   });
-  flash(decision);
-  showCurrent();
+  $('main').onerror = () => toast('Could not load this image.');
+  attachSwipe($('stage'));
+  R.items.forEach((_, i) => paintThumb(i));
+  show(true);
+}
+
+function paintThumb(i) {
+  const el = document.getElementById('strip')?.children[i];
+  if (!el) return;
+  const it = R.items[i];
+  el.className = 'th' + (i === R.idx ? ' cur' : '') + (it.d === 'keep' ? ' keep' : it.d === 'delete' ? ' del' : '');
+}
+
+// Thumbnails are only created near the current photo, so a folder of thousands stays light.
+function ensureThumbs() {
+  const strip = document.getElementById('strip');
+  const lo = Math.max(0, R.idx - THUMBS_BEHIND), hi = Math.min(R.items.length - 1, R.idx + THUMBS_AHEAD);
+  for (let i = lo; i <= hi; i++) {
+    if (R.thumbsSet.has(i)) continue;
+    R.thumbsSet.add(i);
+    const im = document.createElement('img');
+    im.alt = ''; im.decoding = 'async'; im.src = THUMB(R.items[i].p);
+    strip.children[i].appendChild(im);
+  }
+}
+
+function warm(url, low) {
+  if (imgCache.has(url)) return;
+  const im = new Image();
+  im.decoding = 'async';
+  if (low) im.fetchPriority = 'low';
+  im.src = url;
+  imgCache.set(url, im);
+}
+
+function preload() {
+  const want = new Set();
+  for (let k = -BEHIND; k <= AHEAD; k++) {
+    const it = R.items[R.idx + k];
+    if (!it || k === 0) continue;
+    const u = BIG(it.p);
+    want.add(u);
+    warm(u, k < 0 || k > 3); // the next few are fetched first, the rest in the background
+  }
+  if (imgCache.size > 120) {
+    for (const u of imgCache.keys()) { if (imgCache.size <= 90) break; if (!want.has(u)) imgCache.delete(u); }
+  }
+}
+
+let prevIdx = -1;
+function show(initial) {
+  const it = R.items[R.idx];
+  const $ = (id) => document.getElementById(id);
+  if (!$('main')) return;
+  $('main').src = BIG(it.p);
+  $('fname').textContent = it.p.split('/').pop();
+  const chip = $('chip');
+  chip.className = 'chip' + (it.d === 'keep' ? ' keep' : it.d === 'delete' ? ' del' : '');
+  chip.textContent = it.d === 'keep' ? '✓ Kept' : it.d === 'delete' ? (markMode() ? '🗑 Marked' : '🗑 Deleted') : '';
+  $('count').textContent = `${R.idx + 1} / ${R.items.length} · ${undecidedCount()} left`;
+  $('undo').disabled = R.history.length === 0;
+  if (prevIdx !== R.idx) { paintThumb(prevIdx); paintThumb(R.idx); }
+  prevIdx = R.idx;
+  ensureThumbs();
+  const cur = $('strip').children[R.idx];
+  if (cur) {
+    const strip = $('strip');
+    strip.scrollTo({ left: cur.offsetLeft - strip.clientWidth / 2 + cur.offsetWidth / 2, behavior: initial ? 'auto' : 'smooth' });
+  }
+  paintDone();
+  preload();
+}
+
+function jump(i) {
+  if (!R) return;
+  R.idx = Math.max(0, Math.min(R.items.length - 1, i));
+  R.showDone = false;
+  show();
+}
+const move = (delta) => jump(R.idx + delta);
+
+function nextUndecided(from) {
+  const n = R.items.length;
+  for (let i = from + 1; i < n; i++) if (!R.items[i].d) return i;
+  for (let i = 0; i <= from; i++) if (!R.items[i].d) return i;
+  return -1;
+}
+function jumpNextUndecided() {
+  const n = nextUndecided(R.idx);
+  if (n < 0) return toast('Every photo here has been reviewed.');
+  jump(n);
+}
+
+// Optimistic: update the screen at once, sync with the server in order in the background.
+function decide(decision) {
+  if (!R || R.showDone) return;
+  const it = R.items[R.idx];
+  const prev = it.d || null;
+  const before = undecidedCount();
+  if (prev !== decision) {
+    it.d = decision;
+    R.history.push({ p: it.p, prev });
+    const state = R, idx = R.idx;
+    state.chain = state.chain.then(() => post('decide', { path: it.p, decision })).catch((e) => {
+      toast('Failed to save ' + it.p.split('/').pop() + ': ' + e.message);
+      it.d = prev;
+      for (let i = state.history.length - 1; i >= 0; i--) if (state.history[i].p === it.p) { state.history.splice(i, 1); break; }
+      if (R === state) { paintThumb(idx); show(); }
+    });
+    flash(decision);
+    paintThumb(R.idx);
+  }
+  if (R.auto) { const n = nextUndecided(R.idx); if (n >= 0) R.idx = n; else if (prev === decision) move(1); }
+  else if (prev === decision) { /* same key again: just step on */ if (R.idx < R.items.length - 1) R.idx++; }
+  if (before > 0 && undecidedCount() === 0) R.showDone = true;
+  show();
 }
 
 function undo() {
   if (!R || R.history.length === 0) return;
+  const h = R.history.pop();
+  const i = R.items.findIndex((x) => x.p === h.p);
+  if (i < 0) return;
+  R.items[i].d = h.prev;
+  R.idx = i;
+  R.showDone = false;
+  R.chain = R.chain.then(() => (h.prev ? post('decide', { path: h.p, decision: h.prev }) : post('undo', { path: h.p })))
+    .catch((e) => toast('Undo failed: ' + e.message));
+  paintThumb(i);
+  show();
+}
+
+function openFull() {
+  if (R) window.open('/api/img?w=0&' + q(R.items[R.idx].p), '_blank', 'noopener');
+}
+
+async function findNextFolder() {
+  const parent = R.path.includes('/') ? R.path.slice(0, R.path.lastIndexOf('/')) : '';
+  if (!R.path) return null;
   const state = R;
-  const last = state.history.pop();
-  last.decision === 'keep' ? state.kept-- : state.deleted--;
-  state.queue.unshift(last.path);
-  state.chain = state.chain.then(() => post('undo', { path: last.path })).catch((e) => toast('Undo failed: ' + e.message));
-  showCurrent();
+  await state.chain; // make sure every decision is saved before asking the server what's left
+  try {
+    const d = await api('folders?' + q(parent));
+    const i = d.folders.findIndex((f) => f.path === state.path);
+    const order = d.folders.slice(i + 1).concat(d.folders.slice(0, Math.max(i, 0)));
+    return order.find((f) => f.status === 'new' || f.status === 'partial') || null;
+  } catch { return null; }
+}
+
+function paintDone() {
+  const box = document.getElementById('done');
+  if (!box) return;
+  if (!R.showDone) { box.style.display = 'none'; box.dataset.on = ''; return; }
+  box.style.display = 'flex';
+  if (box.dataset.on) return;
+  box.dataset.on = '1';
+  const kept = R.items.filter((x) => x.d === 'keep').length;
+  const marked = R.items.filter((x) => x.d === 'delete').length;
+  box.innerHTML = `<div class="center"><h2>Folder done ✓</h2>
+    <p class="muted">${kept} kept · ${marked} ${markMode() ? 'marked for deletion' : 'deleted'}</p>
+    <div class="bar" style="justify-content:center">
+      <button class="primary" id="nextfolder" style="display:none"></button>
+      <button id="donehome">Back to folders</button>
+      <button id="donelook">Keep looking</button></div></div>`;
+  document.getElementById('donehome').onclick = leave;
+  document.getElementById('donelook').onclick = () => { R.showDone = false; paintDone(); };
+  findNextFolder().then((f) => {
+    const b = document.getElementById('nextfolder');
+    if (!f || !b) return;
+    b.textContent = 'Next: ' + f.name + ' →';
+    b.style.display = '';
+    b.onclick = () => go('review', f.path);
+  });
 }
 
 function flash(decision) {
@@ -268,6 +443,7 @@ function flash(decision) {
   requestAnimationFrame(() => { f.style.opacity = 1; setTimeout(() => f.remove(), 180); });
 }
 
+// Swipe to browse (like a photo gallery). Keep and delete are the buttons.
 function attachSwipe(el) {
   let x0 = null, y0 = null;
   el.addEventListener('touchstart', (e) => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
@@ -275,7 +451,7 @@ function attachSwipe(el) {
     if (x0 === null) return;
     const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
     x0 = null;
-    if (Math.abs(dx) > 80 && Math.abs(dx) > Math.abs(dy) * 1.5) decide(dx > 0 ? 'keep' : 'delete');
+    if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) move(dx > 0 ? -1 : 1);
   });
 }
 
