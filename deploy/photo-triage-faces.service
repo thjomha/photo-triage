@@ -1,0 +1,21 @@
+[Unit]
+Description=Photo Triage face and search service (loopback only)
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=photo-triage
+WorkingDirectory=/opt/photo-triage
+EnvironmentFile=/etc/photo-triage.env
+Environment=FACES_DB=/var/lib/photo-triage/faces.db
+Environment=FACES_MODELS=/var/lib/photo-triage/models
+ExecStart=/opt/photo-triage/.venv/bin/python -m faces.api
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

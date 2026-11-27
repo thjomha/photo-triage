@@ -91,6 +91,11 @@ npx wrangler deploy
 
 This app can delete your photos, and the Worker itself has no login. Put **Cloudflare Access** in front of the Worker's hostname (Zero Trust → Access → Applications) with an email one-time-PIN or Google policy that allows only you. Without this, anyone who finds the URL can use it.
 
+## 5. People and Search (optional)
+
+Face grouping, naming and search over names, places, dates and descriptions. Nothing is
+renamed; it all lives in a database on the server. See [deploy/FACES.md](deploy/FACES.md).
+
 ## Notes and limits
 
 - Only photos directly inside a folder are reviewed when you open it. Subfolders are navigated from the folder list.

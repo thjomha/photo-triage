@@ -232,6 +232,39 @@ async function admin(req, res, u) {
   throw httpErr(404, 'not found');
 }
 
+// ---- face service -------------------------------------------------------------------------------
+// People, face groups and photo descriptions live in a separate Python service (see /faces) that
+// listens on loopback. This API only checks the token and forwards /faces/* to it.
+const FACES_HOST = process.env.FACES_HOST || '127.0.0.1';
+const FACES_PORT = Number(process.env.FACES_PORT || 8788);
+
+function proxyFaces(req, res, u) {
+  return new Promise((resolve) => {
+    const headers = {};
+    if (req.headers['content-type']) headers['content-type'] = req.headers['content-type'];
+    if (req.headers['content-length']) headers['content-length'] = req.headers['content-length'];
+    const up = http.request(
+      { host: FACES_HOST, port: FACES_PORT, method: req.method, path: u.pathname + u.search, headers },
+      (r) => {
+        const out = {};
+        for (const h of ['content-type', 'content-length', 'cache-control']) if (r.headers[h]) out[h] = r.headers[h];
+        res.writeHead(r.statusCode, out);
+        r.pipe(res);
+        r.on('end', resolve);
+        r.on('error', () => { res.destroy(); resolve(); });
+      },
+    );
+    up.setTimeout(120000, () => up.destroy(new Error('timeout')));
+    up.on('error', () => {
+      if (!res.headersSent) {
+        send(res, 502, { error: 'The face service is not running on the server. Start it with: sudo systemctl start photo-triage-faces' });
+      }
+      resolve();
+    });
+    req.pipe(up);
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (!authed(req)) return send(res, 401, { error: 'unauthorized' });
@@ -239,6 +272,7 @@ const server = http.createServer(async (req, res) => {
     const rel = clean(u.searchParams.get('path'));
     const atVirtualRoot = MULTI && !rel;
 
+    if (u.pathname.startsWith('/faces/')) return await proxyFaces(req, res, u);
     if (u.pathname.startsWith('/admin/')) return await admin(req, res, u);
 
     // GET /folders?path=  -> immediate subfolders with the number of photos directly inside each.

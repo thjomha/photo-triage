@@ -74,6 +74,36 @@
   .opt input { margin-top:4px; }
   input[type=text], input:not([type]) { font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--line);
           border-radius:8px; padding:9px 12px; min-width:0; flex:1 1 160px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:10px; }
+  .gcard { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; cursor:pointer; }
+  .gcard:hover { border-color:var(--dim); }
+  .gcard img { width:100%; aspect-ratio:4/3; object-fit:cover; display:block; background:#000; }
+  .gcap { padding:6px 8px 8px; font-size:13px; line-height:1.3; }
+  .gcap .gname { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .ccard { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:12px; }
+  .cthumbs { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
+  .cthumbs img, .fgrid img { width:72px; height:72px; object-fit:cover; border-radius:8px; background:#000; display:block; }
+  .crow { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; align-items:center; }
+  .fgrid { display:flex; gap:6px; flex-wrap:wrap; margin-top:10px; }
+  .fgrid label { position:relative; cursor:pointer; }
+  .fgrid input { position:absolute; top:4px; left:4px; width:18px; height:18px; }
+  .fgrid label.off img { opacity:.35; }
+  .pgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(110px, 1fr)); gap:10px; }
+  .pcard { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px; text-align:center; cursor:pointer; }
+  .pcard:hover { border-color:var(--dim); }
+  .pcard img { width:72px; height:72px; border-radius:50%; object-fit:cover; background:#000; }
+  .chip2 { display:inline-block; padding:2px 10px; border-radius:99px; border:1px solid var(--line); margin:0 4px 4px 0;
+           font-size:13px; cursor:pointer; background:var(--bg); }
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.88); z-index:20; display:flex; align-items:center; justify-content:center; padding:12px; }
+  #modal .box { background:var(--panel); border:1px solid var(--line); border-radius:14px; max-width:1100px; width:100%; max-height:100%;
+                overflow:auto; display:flex; flex-wrap:wrap; }
+  #modal .pic { flex:1 1 520px; min-height:220px; background:#000; display:flex; align-items:center; justify-content:center; }
+  #modal .pic img { max-width:100%; max-height:80vh; object-fit:contain; display:block; }
+  #modal .info { flex:1 1 300px; padding:14px 16px; min-width:0; }
+  #modal textarea { width:100%; min-height:70px; font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--line);
+                    border-radius:8px; padding:8px 10px; resize:vertical; }
+  .path { font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12px; word-break:break-all; background:var(--bg);
+          padding:6px 8px; border-radius:6px; margin:6px 0; }
   code { background:var(--bg); padding:1px 5px; border-radius:4px; }
   .mrow { display:flex; align-items:center; gap:12px; padding:8px; background:var(--panel);
           border:1px solid var(--line); border-radius:10px; margin-bottom:6px; }
@@ -115,10 +145,13 @@ const markMode = () => CONFIG.deleteMode !== 'move';
 function go(mode, path) { location.hash = mode + ':' + encodeURIComponent(path); }
 window.addEventListener('hashchange', route);
 function route() {
-  const m = /^#(browse|review|marked|settings):(.*)$/.exec(location.hash);
+  const m = /^#(browse|review|marked|settings|people|person|search):(.*)$/.exec(location.hash);
   const mode = m ? m[1] : 'browse';
   const path = m ? decodeURIComponent(m[2]) : '';
-  configP.then(() => ({ review: reviewView, marked: markedView, settings: settingsView }[mode] || browseView)(path));
+  closeModal();
+  $app.style.maxWidth = '';
+  configP.then(() => ({ review: reviewView, marked: markedView, settings: settingsView,
+                        people: peopleView, person: personView, search: searchView }[mode] || browseView)(path));
 }
 
 /* ---------- browse ---------- */
@@ -152,6 +185,8 @@ async function browseView(path) {
         : `<span class="badge done">✓ all photos in this folder reviewed</span>`;
     html += `<button id="dellist">🗑 Delete list (${d.deleteListTotal})</button>`;
     if (path) html += '<button id="dellist-here">This folder’s list</button>';
+    html += '<button id="people" title="Name the people in your photos">👤 People</button>';
+    html += '<button id="search" title="Search photos by who, where and when">🔎 Search</button>';
     html += '<button id="settings" title="Settings">⚙ Settings</button>';
     html += '</div>';
     html += d.folders.length
@@ -165,6 +200,8 @@ async function browseView(path) {
     $app.querySelector('#dellist')?.addEventListener('click', () => go('marked', ''));
     $app.querySelector('#dellist-here')?.addEventListener('click', () => go('marked', path));
     $app.querySelector('#settings')?.addEventListener('click', () => go('settings', ''));
+    $app.querySelector('#people')?.addEventListener('click', () => go('people', ''));
+    $app.querySelector('#search')?.addEventListener('click', () => go('search', ''));
   } catch (e) {
     $app.innerHTML = `<div class="err">${esc(e.message)}</div><button onclick="route()">Retry</button>`;
   }
@@ -453,6 +490,371 @@ function attachSwipe(el) {
     x0 = null;
     if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) move(dx > 0 ? -1 : 1);
   });
+}
+
+/* ---------- people & search (talks to the face service on your server) ---------- */
+const fapi = (p, o) => api('faces/' + p, o);
+const fpost = (p, body) => post('faces/' + p, body);
+const cropUrl = (id) => '/api/faces/crop/' + id;
+const thumbUrl = (p, w) => `/api/img?w=${w}&` + q(p);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const num = (x) => Number(x || 0).toLocaleString();
+
+function serviceError(e, backLabel, backFn) {
+  $app.innerHTML = `<div class="crumbs"><a id="back">← ${esc(backLabel)}</a></div>
+    <div class="err">${esc(e.message)}</div>
+    <p class="muted small">The face service runs on your server. Setup steps are in <code>deploy/FACES.md</code> in the repository.</p>
+    <button onclick="route()">Retry</button>`;
+  document.getElementById('back').onclick = backFn;
+}
+
+/* ----- People: name face groups ----- */
+async function peopleView() {
+  cleanupReview();
+  $app.style.maxWidth = '1100px';
+  $app.innerHTML = '<p class="muted">Loading…</p>';
+  let st, ppl;
+  try { [st, ppl] = await Promise.all([fapi('status'), fapi('people')]); }
+  catch (e) { return serviceError(e, 'Folders', () => go('browse', '')); }
+
+  const sc = st.scan;
+  let scanTxt;
+  if (!sc) scanTxt = 'The scanner has not run yet.';
+  else if (sc.state === 'listing') scanTxt = 'Scanner is listing photos…';
+  else if (sc.state === 'running') scanTxt = `Scanner running: ${num(sc.done)} of ${num(sc.total)} photos (about ${esc(sc.eta || '?')} left)`;
+  else if (sc.state === 'stalled') scanTxt = 'The scanner looks stopped (no progress for 2 minutes).';
+  else scanTxt = `Last scan: ${num(sc.done)} photos` + (sc.finished ? ' on ' + new Date(sc.finished * 1000).toLocaleString() : '');
+
+  $app.innerHTML = `
+    <div class="crumbs"><a id="back">← Folders</a></div>
+    <h2 style="margin:0 0 10px">People</h2>
+    <section class="card">
+      <div><b>${num(st.photos)}</b> photos indexed · <b>${num(st.faces)}</b> faces found · <b>${num(st.unnamed_faces)}</b> not named yet · <b>${num(st.people)}</b> people</div>
+      <div class="muted small" style="margin-top:4px">${scanTxt}</div>
+      ${st.models_ok ? '' : '<div class="note" style="margin-top:8px">Face models are not installed on the server yet, so faces can’t be found. Dates, places and search still work. See <code>deploy/FACES.md</code>.</div>'}
+      <div class="bar" style="margin:10px 0 0">
+        <button id="refresh">Refresh</button>
+        ${st.ungrouped_faces > 0 ? `<button class="primary" id="group">Group ${num(st.ungrouped_faces)} new faces</button>` : ''}
+        <button id="gosearch">🔎 Search photos</button>
+      </div>
+    </section>
+    <datalist id="peoplenames">${ppl.items.map((p) => `<option value="${esc(p.name)}">`).join('')}</datalist>
+    <h3 style="margin:18px 0 8px">Who are these?</h3>
+    <label class="muted small"><input type="checkbox" id="singles"> include groups with only one face</label>
+    <div id="clusters" style="margin-top:10px"></div>
+    <div class="bar"><button id="moreclusters" style="display:none">Show more</button></div>
+    <h3 style="margin:22px 0 8px">People</h3>
+    <div class="pgrid">${ppl.items.map((p) => `
+      <div class="pcard" data-id="${p.id}">${p.sample ? `<img alt="" src="${cropUrl(p.sample)}">` : ''}
+        <div><b>${esc(p.name)}</b></div><div class="muted small">${num(p.photos)} photo${p.photos === 1 ? '' : 's'}</div></div>`).join('')
+        || '<p class="muted">Nobody named yet. Name a group above to start.</p>'}</div>`;
+  const $ = (id) => document.getElementById(id);
+  $('back').onclick = () => go('browse', '');
+  $('refresh').onclick = () => peopleView();
+  $('gosearch').onclick = () => go('search', '');
+  $app.querySelectorAll('.pcard').forEach((el) => el.addEventListener('click', () => go('person', el.dataset.id)));
+  $('group')?.addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = 'Grouping…';
+    try {
+      await fpost('cluster', {});
+      for (let i = 0; i < 800; i++) {
+        await sleep(1500);
+        const s = await fapi('status');
+        if (!s.cluster || s.cluster.state !== 'running') break;
+      }
+    } catch (err) { toast(err.message); }
+    peopleView();
+  });
+
+  let offset = 0;
+  const PAGE_C = 8;
+  const loadClusters = async (append) => {
+    const box = $('clusters');
+    if (!append) { box.innerHTML = ''; offset = 0; }
+    let d;
+    try { d = await fapi(`clusters?limit=${PAGE_C}&offset=${offset}&min_size=${$('singles').checked ? 1 : 2}`); }
+    catch (e) { box.innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+    offset += d.items.length;
+    if (!append && !d.items.length) {
+      box.innerHTML = `<p class="muted">${st.unnamed_faces ? 'No groups yet. Press “Group … new faces” above.' : 'Nothing to name right now.'}</p>`;
+    }
+    d.items.forEach((c) => box.appendChild(clusterCard(c)));
+    $('moreclusters').style.display = offset < d.total ? '' : 'none';
+  };
+  $('singles').onchange = () => loadClusters(false);
+  $('moreclusters').onclick = () => loadClusters(true);
+  loadClusters(false);
+}
+
+function clusterCard(c) {
+  const card = document.createElement('div');
+  card.className = 'ccard';
+  card.innerHTML = `
+    <div class="cthumbs">${c.sample.map((id) => `<img alt="" loading="lazy" src="${cropUrl(id)}">`).join('')}</div>
+    <div class="muted small">${num(c.faces)} faces in ${num(c.photos)} photo${c.photos === 1 ? '' : 's'}</div>
+    ${c.suggestion ? `<div class="crow"><button class="primary usesug">✓ This is ${esc(c.suggestion.name)} (${Math.round(c.suggestion.score * 100)}% match)</button></div>` : ''}
+    <div class="crow"><input class="nm" list="peoplenames" placeholder="Who is this?" maxlength="80">
+      <button class="primary save">Save name</button></div>
+    <div class="crow"><button class="show">Check every face</button><button class="skip">Skip</button>
+      <button class="ign" title="Not a face, or someone you don't want to name">Not a person</button></div>
+    <div class="fgrid" style="display:none"></div>`;
+  const nm = card.querySelector('.nm'), grid = card.querySelector('.fgrid');
+  let loaded = false;
+
+  const selectedIds = () => [...grid.querySelectorAll('input')].filter((i) => i.checked).map((i) => Number(i.value));
+  const allChecked = () => !loaded || grid.querySelectorAll('input:not(:checked)').length === 0;
+  const save = async (name) => {
+    name = (name || '').trim();
+    if (!name) return toast('Type a name first.');
+    const body = allChecked() ? { cluster_id: c.id, name } : { face_ids: selectedIds(), name };
+    try {
+      const r = await fpost('name', body);
+      toast(`Saved ${r.assigned} face${r.assigned === 1 ? '' : 's'} as ${name}`);
+      card.remove();
+      if (!document.querySelector('.ccard')) peopleView();
+    } catch (e) { toast(e.message); }
+  };
+  card.querySelector('.save').onclick = () => save(nm.value);
+  nm.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(nm.value); });
+  card.querySelector('.usesug')?.addEventListener('click', () => save(c.suggestion.name));
+  card.querySelector('.skip').onclick = () => card.remove();
+  card.querySelector('.ign').onclick = async () => {
+    if (!confirm('Hide these faces from naming? (Not a face, or someone you don’t need to name.)')) return;
+    try { await fpost('ignore', { cluster_id: c.id }); card.remove(); } catch (e) { toast(e.message); }
+  };
+  card.querySelector('.show').onclick = async (e) => {
+    if (grid.style.display !== 'none') { grid.style.display = 'none'; e.target.textContent = 'Check every face'; return; }
+    e.target.textContent = 'Hide faces';
+    grid.style.display = 'flex';
+    if (loaded) return;
+    try {
+      const d = await fapi(`cluster/${c.id}?limit=120`);
+      grid.innerHTML = d.faces.map((f) => `<label title="${esc(f.path)}"><input type="checkbox" value="${f.id}" checked><img alt="" src="${cropUrl(f.id)}"></label>`).join('') +
+        (d.total > d.faces.length ? `<div class="muted small" style="align-self:center">+${d.total - d.faces.length} more</div>` : '');
+      grid.addEventListener('change', (ev) => ev.target.closest('label')?.classList.toggle('off', !ev.target.checked));
+      loaded = true; // if there are more than 120 faces, only the ticked ones shown here are named
+      toast('Untick any face that is a different person, then save.');
+    } catch (err) { toast(err.message); }
+  };
+  return card;
+}
+
+/* ----- One person ----- */
+async function personView(id) {
+  cleanupReview();
+  $app.style.maxWidth = '1100px';
+  $app.innerHTML = '<p class="muted">Loading…</p>';
+  let d, ppl;
+  try { [d, ppl] = await Promise.all([fapi(`person/${id}?limit=96`), fapi('people')]); }
+  catch (e) { return serviceError(e, 'People', () => go('people', '')); }
+
+  $app.innerHTML = `
+    <div class="crumbs"><a id="back">← People</a></div>
+    <h2 style="margin:0">${esc(d.name)}</h2>
+    <p class="muted" style="margin:2px 0 12px">${num(d.photos)} photo${d.photos === 1 ? '' : 's'} · ${num(d.faces_total)} faces</p>
+    <div class="bar">
+      <button class="primary" id="show">🔎 Show photos of ${esc(d.name)}</button>
+      <button id="rename">Rename</button><button id="merge">Merge into…</button><button id="delete">Remove person</button>
+    </div>
+    <div id="mergebox" class="bar" style="display:none">
+      <select id="mergeto">${ppl.items.filter((p) => p.id !== d.id).map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select>
+      <button class="primary" id="domerge">Merge all their photos into this person</button></div>
+    <h3 style="margin:16px 0 4px">Faces</h3>
+    <p class="muted small" style="margin:0 0 6px">Tick any face that is <b>not</b> ${esc(d.name)} and press Remove.</p>
+    <div class="fgrid" id="pf">${d.faces.map((f) => `<label title="${esc(f.path)}"><input type="checkbox" value="${f.id}"><img alt="" src="${cropUrl(f.id)}"></label>`).join('')}</div>
+    ${d.faces_total > d.faces.length ? `<p class="muted small">Showing the ${d.faces.length} clearest of ${num(d.faces_total)} faces.</p>` : ''}
+    <div class="bar" style="margin-top:12px"><button id="remove" disabled>Remove selected</button></div>`;
+  const $ = (x) => document.getElementById(x);
+  $('back').onclick = () => go('people', '');
+  $('show').onclick = () => go('search', 'people=' + d.id);
+  $('rename').onclick = async () => {
+    const name = prompt('Name', d.name);
+    if (!name || name.trim() === d.name) return;
+    try { await fpost('people/rename', { id: d.id, name }); personView(id); } catch (e) { toast(e.message); }
+  };
+  $('merge').onclick = () => { $('mergebox').style.display = $('mergebox').style.display === 'none' ? 'flex' : 'none'; };
+  $('domerge').onclick = async () => {
+    const to = Number($('mergeto').value);
+    if (!to) return toast('There is nobody else to merge into.');
+    const target = $('mergeto').selectedOptions[0].textContent;
+    if (!confirm(`Merge ${d.name} into ${target}? All their photos become ${target}.`)) return;
+    try { await fpost('people/merge', { from: d.id, into: to }); go('person', String(to)); } catch (e) { toast(e.message); }
+  };
+  $('delete').onclick = async () => {
+    if (!confirm(`Remove ${d.name}? Their faces go back to unnamed. No photos are touched.`)) return;
+    try { await fpost('people/delete', { id: d.id }); go('people', ''); } catch (e) { toast(e.message); }
+  };
+  $('pf').addEventListener('change', (e) => {
+    e.target.closest('label')?.classList.toggle('off', e.target.checked);
+    $('remove').disabled = !$('pf').querySelector('input:checked');
+  });
+  $('remove').onclick = async () => {
+    const ids = [...$('pf').querySelectorAll('input:checked')].map((i) => Number(i.value));
+    try { await fpost('unassign', { face_ids: ids }); toast(`Removed ${ids.length}. Press “Group new faces” on the People page to re-sort them.`); personView(id); }
+    catch (e) { toast(e.message); }
+  };
+}
+
+/* ----- Search ----- */
+let searchResults = [];
+
+async function searchView(qs) {
+  cleanupReview();
+  $app.style.maxWidth = '1100px';
+  const params = new URLSearchParams(qs || '');
+  let people = (params.get('people') || '').split(',').filter((x) => /^\d+$/.test(x)).map(Number);
+  $app.innerHTML = '<p class="muted">Loading…</p>';
+  let ppl;
+  try { ppl = (await fapi('people')).items; }
+  catch (e) { return serviceError(e, 'Folders', () => go('browse', '')); }
+  const nameOf = (id) => (ppl.find((p) => p.id === id) || {}).name || '?';
+
+  $app.innerHTML = `
+    <div class="crumbs"><a id="back">← Folders</a></div>
+    <h2 style="margin:0 0 10px">Search photos</h2>
+    <div class="bar"><input id="sq" type="text" style="flex:1 1 260px" placeholder="Who, where, when… e.g. “Yasmeen Jasper 2021”" value="${esc(params.get('q') || '')}">
+      <button class="primary" id="sgo">Search</button></div>
+    <div class="bar" style="align-items:center">
+      <span id="chips"></span>
+      <select id="padd"><option value="">+ Add a person</option>${ppl.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select>
+      <input id="yf" type="number" min="1990" max="2100" placeholder="From year" style="flex:0 0 110px" value="${esc(params.get('year_from') || '')}">
+      <input id="yt" type="number" min="1990" max="2100" placeholder="To year" style="flex:0 0 110px" value="${esc(params.get('year_to') || '')}">
+    </div>
+    <div id="sinfo" class="muted small" style="margin:4px 0 10px"></div>
+    <div class="grid" id="sgrid"></div>
+    <div class="bar" style="margin-top:12px"><button id="smore" style="display:none">Load more</button></div>`;
+  const $ = (x) => document.getElementById(x);
+  $('back').onclick = () => go('browse', '');
+
+  const paintChips = () => {
+    $('chips').innerHTML = people.map((id) => `<span class="chip2" data-id="${id}" title="Remove">${esc(nameOf(id))} ✕</span>`).join('');
+    $('chips').querySelectorAll('.chip2').forEach((c) => c.addEventListener('click', () => {
+      people = people.filter((x) => x !== Number(c.dataset.id)); paintChips(); run(false);
+    }));
+  };
+  paintChips();
+
+  let offset = 0, total = 0;
+  const cur = () => {
+    const u = new URLSearchParams();
+    if ($('sq').value.trim()) u.set('q', $('sq').value.trim());
+    if (people.length) u.set('people', people.join(','));
+    if ($('yf').value) u.set('year_from', $('yf').value);
+    if ($('yt').value) u.set('year_to', $('yt').value);
+    return u;
+  };
+  const run = async (append) => {
+    const u = cur();
+    if (!append) {
+      offset = 0; searchResults = []; $('sgrid').innerHTML = '';
+      history.replaceState(null, '', '#search:' + encodeURIComponent(u.toString()));
+    }
+    u.set('limit', 48); u.set('offset', offset);
+    let d;
+    try { d = await fapi('search?' + u.toString()); } catch (e) { $('sinfo').innerHTML = `<span style="color:#e07a84">${esc(e.message)}</span>`; return; }
+    total = d.total;
+    const base = searchResults.length;
+    searchResults.push(...d.items);
+    offset += d.items.length;
+    $('sinfo').textContent = total ? `${num(total)} photo${total === 1 ? '' : 's'} found` : 'No photos match. Try fewer words, or check that the scanner has run.';
+    $('sgrid').insertAdjacentHTML('beforeend', d.items.map((it, i) => `
+      <div class="gcard" data-i="${base + i}"><img loading="lazy" alt="" src="${thumbUrl(it.path, 360)}">
+        <div class="gcap"><div>${esc(it.summary || '—')}</div><div class="gname muted small">${esc(it.name)}</div></div></div>`).join(''));
+    $('smore').style.display = offset < total ? '' : 'none';
+  };
+  $('sgo').onclick = () => run(false);
+  $('sq').addEventListener('keydown', (e) => { if (e.key === 'Enter') run(false); });
+  $('yf').addEventListener('keydown', (e) => { if (e.key === 'Enter') run(false); });
+  $('yt').addEventListener('keydown', (e) => { if (e.key === 'Enter') run(false); });
+  $('padd').onchange = (e) => {
+    const id = Number(e.target.value);
+    if (id && !people.includes(id)) { people.push(id); paintChips(); run(false); }
+    e.target.value = '';
+  };
+  $('smore').onclick = () => run(true);
+  $('sgrid').addEventListener('click', (e) => {
+    const c = e.target.closest('.gcard');
+    if (c) openPhoto(Number(c.dataset.i));
+  });
+  run(false);
+}
+
+/* ----- Photo detail (from search results) ----- */
+let modalIdx = -1, modalKey = null;
+
+function closeModal() {
+  document.getElementById('modal')?.remove();
+  if (modalKey) { window.removeEventListener('keydown', modalKey); modalKey = null; }
+  modalIdx = -1;
+}
+
+async function openPhoto(i) {
+  const it = searchResults[i];
+  if (!it) return;
+  modalIdx = i;
+  let m = document.getElementById('modal');
+  if (!m) {
+    m = document.createElement('div');
+    m.id = 'modal';
+    document.body.appendChild(m);
+    m.addEventListener('click', (e) => { if (e.target === m) closeModal(); });
+    modalKey = (e) => {
+      if (['TEXTAREA', 'INPUT'].includes(e.target.tagName)) { if (e.key === 'Escape') e.target.blur(); return; }
+      if (e.key === 'Escape') closeModal();
+      else if (e.key === 'ArrowRight') openPhoto(Math.min(searchResults.length - 1, modalIdx + 1));
+      else if (e.key === 'ArrowLeft') openPhoto(Math.max(0, modalIdx - 1));
+    };
+    window.addEventListener('keydown', modalKey);
+  }
+  m.innerHTML = `<div class="box"><div class="pic"><img alt="" src="${thumbUrl(it.path, 1400)}"></div>
+    <div class="info"><p class="muted">Loading…</p></div></div>`;
+  let d, fl;
+  try { [d, fl] = await Promise.all([fapi('photo?' + q(it.path)), fapi('folder?folder=' + encodeURIComponent(it.folder))]); }
+  catch (e) { m.querySelector('.info').innerHTML = `<div class="err">${esc(e.message)}</div>`; return; }
+  if (modalIdx !== i) return; // moved on while loading
+
+  const named = [...new Map(d.faces.filter((f) => f.person_id).map((f) => [f.person_id, f.name])).entries()];
+  const unnamed = d.faces.filter((f) => !f.person_id && !f.ignored).length;
+  const when = d.taken_at ? new Date(d.taken_at).toLocaleDateString([], { dateStyle: 'long' }) + (d.date_source === 'mtime' ? ' <span class="muted small">(file date, no photo date found)</span>' : '') : '—';
+  m.querySelector('.info').innerHTML = `
+    <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+      <b>${i + 1} / ${searchResults.length}</b>
+      <span><button id="mprev">‹</button> <button id="mnext">›</button> <button id="mclose">✕</button></span></div>
+    <p style="margin:10px 0 4px"><b>Who:</b> ${named.length ? named.map(([id, n]) => `<span class="chip2" data-p="${id}">${esc(n)}</span>`).join('') : '<span class="muted">nobody named</span>'}
+      ${unnamed ? `<span class="muted small">· ${unnamed} unnamed face${unnamed === 1 ? '' : 's'}</span>` : ''}</p>
+    <p style="margin:4px 0"><b>Where:</b> ${esc(d.place || '—')}</p>
+    <p style="margin:4px 0"><b>When:</b> ${when}</p>
+    <div class="path" id="mpath">${esc(d.path)}</div>
+    <div class="bar" style="margin:4px 0 10px"><button id="mcopy">Copy path</button>
+      <button id="mfull">Full size ↗</button><button id="mfolder">Open folder</button></div>
+    <label class="muted small">Your description (searchable)</label>
+    <textarea id="mnote" maxlength="2000" placeholder="e.g. Elk crossing the road near the lodge">${esc(d.note)}</textarea>
+    <div class="bar" style="margin:6px 0 12px"><button class="primary" id="msave">Save description</button><span id="mmsg" class="muted small"></span></div>
+    <label class="muted small">Place for the whole folder “${esc(d.folder.split('/').pop() || d.folder)}” and what’s inside it</label>
+    <div class="bar" style="margin:4px 0 0"><input id="fplace" type="text" placeholder="e.g. Jasper, Alberta, Canada" value="${esc(fl.place)}" style="flex:1 1 200px">
+      <button id="fsave">Apply</button></div>
+    <p class="muted small" style="margin:4px 0 0">Photos with GPS keep their own place. Leave empty to clear.</p>`;
+  const $ = (x) => m.querySelector('#' + x);
+  $('mclose').onclick = closeModal;
+  $('mprev').onclick = () => openPhoto(Math.max(0, i - 1));
+  $('mnext').onclick = () => openPhoto(Math.min(searchResults.length - 1, i + 1));
+  $('mfull').onclick = () => window.open('/api/img?w=0&' + q(d.path), '_blank', 'noopener');
+  $('mfolder').onclick = () => { closeModal(); go('browse', d.folder); };
+  $('mcopy').onclick = async () => {
+    try { await navigator.clipboard.writeText(d.path); toast('Path copied.'); }
+    catch { const r = document.createRange(); r.selectNodeContents($('mpath')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); toast('Press Ctrl+C to copy.'); }
+  };
+  $('msave').onclick = async () => {
+    try { await fpost('photo/note', { path: d.path, note: $('mnote').value }); it.note = $('mnote').value; $('mmsg').textContent = 'Saved.'; }
+    catch (e) { toast(e.message); }
+  };
+  $('fsave').onclick = async () => {
+    try {
+      const r = await fpost('folder', { folder: d.folder, place: $('fplace').value, note: fl.note });
+      toast(`Updated ${num(r.photos)} photo${r.photos === 1 ? '' : 's'}.`);
+    } catch (e) { toast(e.message); }
+  };
+  m.querySelectorAll('.chip2[data-p]').forEach((c) => c.addEventListener('click', () => { closeModal(); go('search', 'people=' + c.dataset.p); }));
 }
 
 /* ---------- settings ---------- */

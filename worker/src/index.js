@@ -71,6 +71,21 @@ export default {
       const route = `${request.method} ${url.pathname}`;
       const path = (url.searchParams.get('path') ?? '').replace(/^\/+|\/+$/g, '');
 
+      // People, face groups, descriptions and search: handled by the face service on the LAN.
+      // Forwarded as is (JSON, or the little face-crop JPEGs).
+      if (url.pathname.startsWith('/api/faces/')) {
+        const target = '/faces/' + url.pathname.slice('/api/faces/'.length) + url.search;
+        const init = { method: request.method };
+        if (request.method !== 'GET' && request.method !== 'HEAD') {
+          init.body = await request.arrayBuffer();
+          init.headers = { 'content-type': 'application/json' };
+        }
+        const r = await lan(env, target, init);
+        const headers = new Headers({ 'content-type': r.headers.get('content-type') || 'application/json' });
+        if (r.headers.get('cache-control')) headers.set('cache-control', r.headers.get('cache-control'));
+        return new Response(r.body, { status: r.status, headers });
+      }
+
       if (route === 'GET /api/config') return json({ deleteMode: (await getDeleteMode(env)).mode });
 
       // ---- settings page ----
